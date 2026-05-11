@@ -961,6 +961,63 @@ a=sendrecv
         val localCseq: AtomicInteger = AtomicInteger(2),
     )
 
+    private data class AmrNbFrame(
+        val ft: Int,
+        val q: Int,
+        val codecFrame: ByteArray,
+    )
+
+    // AMR-NB speech payload sizes in bits for FT 0..8.
+    // Codec input for Android's audio/3gpp decoder is one AMR storage frame:
+    //   [frame header: 0 | FT(4) | Q | 00] + speech bits octet padded.
+    // The RTP payloads used here are RFC 4867 bandwidth-efficient packets:
+    //   CMR(4), F(1), FT(4), Q(1), speech bits...
+    private val amrNbSpeechBits = intArrayOf(95, 103, 118, 134, 148, 159, 204, 244, 39)
+
+    private fun readPackedBits(src: ByteArray, startBit: Int, bitCount: Int): ByteArray {
+        val out = ByteArray((bitCount + 7) / 8)
+        for (i in 0 until bitCount) {
+            val srcBit = startBit + i
+            val bit = (src[srcBit / 8].toInt() ushr (7 - (srcBit % 8))) and 1
+            if (bit != 0) {
+                out[i / 8] = (out[i / 8].toInt() or (1 shl (7 - (i % 8)))).toByte()
+            }
+        }
+        return out
+    }
+
+    private fun amrNbFrameFromBandwidthEfficientRtp(buf: ByteArray, length: Int): AmrNbFrame? {
+        val payloadOffset = 12
+        if (length < payloadOffset + 2) return null
+
+        val ft = ((buf[payloadOffset].toUByte().toInt() and 0x07) shl 1) or
+            ((buf[payloadOffset + 1].toUByte().toInt() ushr 7) and 0x01)
+        val q = (buf[payloadOffset + 1].toUByte().toInt() ushr 6) and 0x01
+
+        // FT=15 is No-Data. FT=8 is SID; pass it through because Android's AMR
+        // decoder accepts normal AMR storage frames and this avoids decoder state gaps.
+        if (ft == 15) return null
+        if (ft !in amrNbSpeechBits.indices) {
+            Rlog.w(TAG, "Unsupported AMR-NB RTP frame type ft=$ft length=$length")
+            return null
+        }
+
+        val speechBits = amrNbSpeechBits[ft]
+        val speechStartBit = payloadOffset * 8 + 10
+        val availableBits = length * 8 - speechStartBit
+        if (availableBits < speechBits) {
+            Rlog.w(TAG, "Short AMR-NB RTP payload ft=$ft length=$length availableBits=$availableBits needed=$speechBits")
+            return null
+        }
+
+        val frameHeader = ((ft shl 3) or (q shl 2)).toByte()
+        return AmrNbFrame(
+            ft = ft,
+            q = q,
+            codecFrame = byteArrayOf(frameHeader) + readPackedBits(buf, speechStartBit, speechBits),
+        )
+    }
+
 
     @SuppressLint("MissingPermission")
     fun callEncodeThread() {
@@ -1376,8 +1433,9 @@ a=sendrecv
 
             val rtpSocket = DatagramSocket(0, localAddr)
             network.bindSocket(rtpSocket)
-            //rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
-            Rlog.d(TAG, "RTP socket created for outgoing call: local=${rtpSocket.localAddress}:${rtpSocket.localPort}")
+            rtpSocket.soTimeout = 2000
+            // Connect later once the remote RTP address/port is known from SDP.
+            Rlog.d(TAG, "RTP socket created for outgoing call: local=${rtpSocket.localAddress}:${rtpSocket.localPort} timeout=${rtpSocket.soTimeout}")
 
             val amrTrack = 97
             val amrTrackDesc = "fmtp:97 mode-change-capability=2;octet-align=0;max-red=0"
@@ -1548,6 +1606,15 @@ a=sendrecv
                 }
                 val rtpRemotePort = sdpElement("m")!!.split(" ")[1]
                 val rtpRemoteAddr = InetAddress.getByName(sdpElement("c")!!.split(" ")[2])
+                val rtpRemotePortInt = rtpRemotePort.toInt()
+                try {
+                    if (!rtpSocket.isConnected || rtpSocket.inetAddress != rtpRemoteAddr || rtpSocket.port != rtpRemotePortInt) {
+                        rtpSocket.connect(rtpRemoteAddr, rtpRemotePortInt)
+                        Rlog.d(TAG, "Outgoing RTP socket connected to ${rtpRemoteAddr}:${rtpRemotePortInt} local=${rtpSocket.localAddress}:${rtpSocket.localPort}")
+                    }
+                } catch (e: Exception) {
+                    Rlog.w(TAG, "Failed to connect outgoing RTP socket to ${rtpRemoteAddr}:${rtpRemotePortInt}", e)
+                }
                 val inviteCseqForDialog = resp.headers["cseq"]!![0].substringBefore(" ").toIntOrNull() ?: 1
                 val nextLocalCseqForDialog = inviteCseqForDialog + if (rseqHandled) 2 else 1
                 currentCall = Call(
@@ -1564,7 +1631,7 @@ a=sendrecv
                         ("call-id" to resp.headers["call-id"]!!) +
                         (resp.headers["record-route"]?.let { mapOf("record-route" to it, "route" to it) } ?: emptyMap()),
                     rtpRemoteAddr = rtpRemoteAddr,
-                    rtpRemotePort = rtpRemotePort.toInt(),
+                    rtpRemotePort = rtpRemotePortInt,
                     rtpSocket = rtpSocket,
                     sdp = resp.body,
                     hasEarlyMedia = resp.headers["p-early-media"]?.isNotEmpty() == true,
@@ -1654,51 +1721,50 @@ a=sendrecv
                 if (callStopped.get() || callGeneration.get() != gen) break
                 val dgramBuf = ByteArray(2048)
                 val dgram = DatagramPacket(dgramBuf, dgramBuf.size)
-                currentCall!!.rtpSocket.receive(dgram)
+                val receiveCall = currentCall ?: break
+                try {
+                    receiveCall.rtpSocket.receive(dgram)
+                } catch (e: SocketTimeoutException) {
+                    Rlog.w(TAG, "RTP receive timeout: outgoing=${receiveCall.outgoing} local=${receiveCall.rtpSocket.localAddress}:${receiveCall.rtpSocket.localPort} connected=${receiveCall.rtpSocket.isConnected} remote=${receiveCall.rtpRemoteAddr}:${receiveCall.rtpRemotePort} callStopped=${callStopped.get()} genMismatch=${callGeneration.get() != gen}")
+                    continue
+                }
                 receivedCount++
 
-                // Check RTP payload type
+                // Check RTP payload type and convert AMR-NB bandwidth-efficient RTP
+                // payloads into generic AMR storage frames for MediaCodec.  The old code
+                // only decoded FT=7, which made calls silent whenever the network switched
+                // to a lower AMR mode such as FT=2.
                 val pt = dgramBuf[1].toUByte().toInt() and 0x7f
-                val ft = (dgramBuf[13].toUByte().toUInt() shr 7) or ((dgramBuf[12].toUByte().toUInt() and (7).toUInt()) shl 1)
+                val amrFrame = amrNbFrameFromBandwidthEfficientRtp(dgramBuf, dgram.length)
+                val ftForLog = amrFrame?.ft ?: 15
 
-                if (receivedCount % 50 == 0) {
-                    Rlog.d(TAG, "Received RTP packet #$receivedCount: length=${dgram.length} pt=$pt ft=$ft")
+                if (receivedCount <= 10 || receivedCount % 50 == 0) {
+                    Rlog.d(TAG, "Received RTP packet #$receivedCount: from=${dgram.address}:${dgram.port} length=${dgram.length} pt=$pt ft=$ftForLog codecBytes=${amrFrame?.codecFrame?.size ?: 0}")
                 }
 
-                if(ft.toInt() != 7) continue
-
-                // RTP header 12 byte
-                // AMR in RTP header 10 bits
-                // Packet size 32, FT=7
-                val baOs = ByteArrayOutputStream()
-
-                baOs.write( ft.toInt() shl 3)
-
-                var m = 0
-                // Warning: we should take good care counting the **bits** of the packet based on FT
-                for(i in 13 until dgram.length ) {
-                    // Take 6 bits left, 2 bits right
-                    val left = (dgramBuf[i].toUByte().toUInt().toInt() and 0x3f)  shl 2
-                    val right = (dgramBuf[i + 1 ].toUByte().toUInt().toInt() shr 6) and 0x3
-                    m++
-                    baOs.write(left or right)
-                }
-                //Rlog.d(TAG, "Received RTP data of length ${dgram.length} $m")
+                if (amrFrame == null) continue
 
                 val inBufIndex = decoder.dequeueInputBuffer(-1)
-                //Rlog.d(TAG, "Got decoding input buffer $inBufIndex")
                 val inBuf = decoder.getInputBuffer(inBufIndex)!!
-                val data = baOs.toByteArray()
+                val data = amrFrame.codecFrame
                 inBuf.clear()
                 inBuf.put(data)
                 decoder.queueInputBuffer(inBufIndex, 0, data.size, 0, 0)
 
-                //TODO: Support DTX (comfort noise frames that don't repeat)
-                //TODO: Can we receive multiple outs per in?
+                // Drain decoder output.  Some AMR modes do not produce an output buffer
+                // immediately with a zero-timeout dequeue on all codecs, so give it a tiny
+                // real-time budget for the first buffer and then drain anything else.
                 val outBufInfo = MediaCodec.BufferInfo()
-                val outBufIndex = decoder.dequeueOutputBuffer(outBufInfo, 0)
-                //Rlog.d(TAG, "Got decoding output buffer $outBufIndex")
-                if (outBufIndex >= 0) {
+                var drainTimeoutUs = 10_000L
+                while (true) {
+                    val outBufIndex = decoder.dequeueOutputBuffer(outBufInfo, drainTimeoutUs)
+                    drainTimeoutUs = 0L
+                    if (outBufIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        Rlog.d(TAG, "Decoder output format changed")
+                        continue
+                    }
+                    if (outBufIndex < 0) break
+
                     val outBuf = decoder.getOutputBuffer(outBufIndex)!!
                     audioTrack.write(outBuf, outBufInfo.size, AudioTrack.WRITE_BLOCKING)
                     decoder.releaseOutputBuffer(outBufIndex, false)
