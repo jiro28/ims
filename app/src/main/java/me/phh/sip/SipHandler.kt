@@ -1271,7 +1271,14 @@ a=sendrecv
 
                 val dgramPacket =
                     DatagramPacket(buf, buf.size, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort)
-                sendCall.rtpSocket.send(dgramPacket)
+                try {
+                    sendCall.rtpSocket.send(dgramPacket)
+                } catch (e: Exception) {
+                    Rlog.w(TAG, "Silence RTP send failed, stopping encode thread: ${e.message}", e)
+                    encoder.stop()
+                    encoder.release()
+                    return@thread
+                }
                 sequenceNumber++
             }
             Rlog.d(TAG, "Silence loop exited after $sequenceNumber packets, starting real encoding")
@@ -1839,6 +1846,7 @@ a=sendrecv
                 headers = msg.headers,
                 rtpSocket = rtpSocket,
             )
+            val prackedReliableProvisionals = mutableSetOf<String>()
             setResponseCallback(outgoingInviteCallId) { r: SipResponse ->
                 val responseCallId = r.headers["call-id"]?.getOrNull(0).orEmpty()
                 val responseCseqForLog = r.headers["cseq"]?.getOrNull(0)
@@ -1856,7 +1864,17 @@ a=sendrecv
                 var rseqHandled = false
                 // If we stopped our process to PRACK a response, start again processing it
                 if (cseq.contains("PRACK")) {
-                    resp = respInFlight!!
+                    val savedProvisional = respInFlight
+                    if (savedProvisional == null) {
+                        Rlog.w(TAG, "Ignoring PRACK response without pending provisional response: status=${resp.statusCode} ${resp.statusString} cseq=$cseq")
+                        return@setResponseCallback false
+                    }
+                    if (resp.statusCode >= 300) {
+                        Rlog.w(TAG, "PRACK failed for pending provisional response: status=${resp.statusCode} ${resp.statusString} cseq=$cseq")
+                        respInFlight = null
+                        return@setResponseCallback false
+                    }
+                    resp = savedProvisional
                     respInFlight = null
                     cseq = resp.headers["cseq"]!![0]
                     rseqHandled = true
@@ -1969,6 +1987,11 @@ a=sendrecv
                 }
 
                 if(resp.headers["rseq"]?.isNotEmpty() == true && !rseqHandled) {
+                    val reliableKey = "${resp.headers["rseq"]?.getOrNull(0).orEmpty()} ${resp.headers["cseq"]?.getOrNull(0).orEmpty()}"
+                    if (!prackedReliableProvisionals.add(reliableKey)) {
+                        Rlog.w(TAG, "Ignoring duplicate reliable provisional response already PRACKed: $reliableKey")
+                        return@setResponseCallback false
+                    }
                     prack(resp)
                     respInFlight = resp
                     return@setResponseCallback false
