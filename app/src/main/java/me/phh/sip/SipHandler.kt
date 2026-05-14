@@ -1660,8 +1660,8 @@ a=sendrecv
                 "Content-Length: 0".toSipHeadersMap()
             val msg =
                 SipResponse(
-                    statusCode = 486,
-                    statusString = "Busy Here",
+                    statusCode = 603,
+                    statusString = "Decline",
                     headersParam = myHeaders,
                     autofill = false
                 )
