@@ -1698,7 +1698,7 @@ a=sendrecv
                 if (!callStarted.get()) return@thread
 
                 Rlog.w(TAG, "No post-answer RTP within ${timeoutMs}ms for outgoing call; terminating no-media dialog as network reject callId=$callId")
-                outgoingConnectedCallIds.remove(callId)
+                callId?.let { outgoingConnectedCallIds.remove(it) }
                 callStopped.set(true)
                 callStarted.set(false)
                 threadsStarted.set(false)
@@ -1894,7 +1894,7 @@ a=sendrecv
         closeRtpSocket: Boolean = false,
         reason: String,
     ) {
-        outgoingConnectedCallIds.remove(callId)
+        callId?.let { outgoingConnectedCallIds.remove(it) }
         val pending = pendingOutgoingInvite ?: return
         if (callId != null && pending.callId != callId) return
 
