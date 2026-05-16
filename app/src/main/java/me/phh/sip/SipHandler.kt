@@ -13,7 +13,6 @@ import android.telephony.CellInfoNr
 import android.telephony.CellInfoWcdma
 import android.telephony.Rlog
 import android.telephony.SmsManager
-import android.telephony.SubscriptionManager
 import android.net.TelephonyNetworkSpecifier
 import android.telephony.TelephonyManager
 import android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_IWLAN
@@ -42,33 +41,14 @@ class SipHandler(
     val myHandler = Handler(HandlerThread("PhhMmTelFeature").apply { start() }.looper)
     val myExecutor = Executor { p0 -> myHandler.post(p0) }
 
-    private val subscriptionManager: SubscriptionManager
     private val telephonyManager: TelephonyManager
     private val connectivityManager: ConnectivityManager
     private val ipSecManager: IpSecManager
     init {
-        subscriptionManager = ctxt.getSystemService(SubscriptionManager::class.java)
         telephonyManager = ctxt.getSystemService(TelephonyManager::class.java)
         connectivityManager = ctxt.getSystemService(ConnectivityManager::class.java)
         ipSecManager = ctxt.getSystemService(IpSecManager::class.java)
     }
-
-    private fun getActiveSubscriptionForSlot(): android.telephony.SubscriptionInfo {
-        val activeSubscriptions = subscriptionManager.activeSubscriptionInfoList.orEmpty()
-
-        return activeSubscriptions.firstOrNull {
-            it.simSlotIndex == slotId && it.subscriptionId == requestedSubId
-        } ?: activeSubscriptions.firstOrNull {
-            it.subscriptionId == requestedSubId
-        } ?: activeSubscriptions.firstOrNull {
-            it.simSlotIndex == slotId
-        } ?: throw IllegalStateException(
-            "No active subscription for slotId=$slotId requestedSubId=$requestedSubId"
-        )
-    }
-
-    private fun getDeviceIdForSlot(slotIndex: Int) =
-        telephonyManager.getImei(slotIndex)
 
     private fun getAllCellInfoForRegistrationLog() =
         subTelephonyManager.getAllCellInfo()
@@ -82,10 +62,16 @@ class SipHandler(
             bufferSize,
         )
 
-    private val activeSubscription = getActiveSubscriptionForSlot()
-    private val subId = activeSubscription.subscriptionId
-    private val subTelephonyManager = telephonyManager.createForSubscriptionId(subId)
-    private val imei = getDeviceIdForSlot(activeSubscription.simSlotIndex)
+    private val subscriptionContext = SipSubscriptionContext.resolve(
+        ctxt = ctxt,
+        telephonyManager = telephonyManager,
+        slotId = slotId,
+        requestedSubId = requestedSubId,
+    )
+    private val activeSubscription = subscriptionContext.activeSubscription
+    private val subId = subscriptionContext.subId
+    private val subTelephonyManager = subscriptionContext.telephonyManager
+    private val imei = subscriptionContext.imei
 
     private fun normalizeOutgoingDialTargetForTelUri(rawPhoneNumber: String): String =
         OutgoingDialTargetNormalizer.normalize(
