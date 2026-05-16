@@ -602,18 +602,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             val securityServer = plainRegReply.headers["security-server"]!!
             commonHeaders += ("security-verify" to securityServer)
             registerHeaders += ("security-verify" to securityServer)
-            val supported_alg = listOf("hmac-sha-1-96", "hmac-md5-96")
-            val supported_ealg = listOf("aes-cbc", "null")
-            val (securityServerType, securityServerParams) =
-                securityServer
-                    .map { it.getParams() }
-                    .filter {
-                        val thisEAlg = it.component2()["ealg"] ?: "null"
-                        supported_ealg.contains(thisEAlg)
-                    }
-                    .filter { supported_alg.contains(it.component2()["alg"]) }
-                    .sortedByDescending { it.component2()["q"]?.toFloat() ?: 0.toFloat() }[0]
-            require(securityServerType == "ipsec-3gpp")
+            val securityServerParams = SipSecurityServerSelector.select(securityServer).params
 
             portS = securityServerParams["port-s"]!!.toInt()
             // spi string is 32 bit unsigned, but ipSecManager wants an int...
