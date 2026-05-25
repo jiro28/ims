@@ -2941,6 +2941,12 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
 
             val normalizedPhoneNumber = normalizeOutgoingDialTargetForTelUri(phoneNumber)
             val to = outgoingInviteTargetUri(normalizedPhoneNumber)
+            val singtelOutgoingInvitePaniLine =
+                if (isSingTel()) {
+                    "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=5250102C6B611D01"
+                } else {
+                    ""
+                }
             Rlog.d(TAG, "Outgoing dial target raw=$phoneNumber normalized=$normalizedPhoneNumber uri=$to")
             val sipInstance = "<urn:gsma:imei:${imei.substring(0, 8)}-${imei.substring(8, 14)}-0>"
             val local =
@@ -2969,6 +2975,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     Min-SE: 90
                     Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
                     P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
+                    $singtelOutgoingInvitePaniLine
                     Contact: $contactTel
                     """.toSipHeadersMap() + generateCallId() - "p-asserted-identity"
             // P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
