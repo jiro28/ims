@@ -262,7 +262,9 @@ class SipHandler(
     //private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val user = "$imsi@$realm"
+    private var registerTargetRealm = realm
     private var akaDigest = ""
+    private var registerSecurityClientOverride: String? = null
     private fun initialRegisterAuthorization(): String =
         """Digest username="$user",realm="$realm",nonce="",uri="sip:$realm",response="",algorithm=AKAv1-MD5"""
 
@@ -597,6 +599,8 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         To: <sip:$user>
         """.toSipHeadersMap() + registerCallId
         commonHeaders = "".toSipHeadersMap()
+        registerTargetRealm = realm
+        registerSecurityClientOverride = null
         contact = ""
         mySip = ""
         myTel = ""
@@ -957,6 +961,21 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             SipConnectionUdpServer(network, pcscfAddr, plainSocket.gLocalAddr(), socket.gLocalPort() + 1)
 
         Rlog.d(TAG, "Src port is ${socket.gLocalPort()}, TCP server port is ${serverSocket.localPort}, UDP server port is ${serverSocketUdp.localPort}")
+
+        if (mcc == "525" && mnc.padStart(3, '0') == "001") {
+            registerSecurityClientOverride = SipSecurityClientHeader.build(
+                ipsecSettings = ipsecSettings,
+                clientPort = socket.gLocalPort(),
+                serverPort = serverSocket.localPort,
+                algs = listOf("hmac-sha-1-96"),
+                ealgs = listOf("null"),
+            )
+            Rlog.w(
+                TAG,
+                "Offering SingTel null/SHA1 Security-Client for REGISTER: " +
+                    registerSecurityClientOverride,
+            )
+        }
         updateCommonHeaders(plainSocket)
         register(plainSocket.gWriter())
         fun readPlainRegisterReply(): SipMessage? {
@@ -1030,10 +1049,22 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         plainSocket.close()
 
+        val registerDigestUriRealm =
+            if (registerChallenge.realm.equals("ims.singtel.com", ignoreCase = true)) {
+                Rlog.w(
+                    TAG,
+                    "Using SingTel challenge realm as REGISTER request/digest URI: " +
+                        "oldUri=sip:$realm newUri=sip:${registerChallenge.realm}",
+                )
+                registerChallenge.realm
+            } else {
+                realm
+            }
+        registerTargetRealm = registerDigestUriRealm
         akaDigest = SipRegistrationDigestFactory.create(
             user = user,
             realm = registerChallenge.realm,
-            uri = "sip:$realm",
+            uri = "sip:$registerDigestUriRealm",
             nonceB64 = registerChallenge.nonceB64,
             opaque = registerChallenge.opaque,
             akaResult = akaResult,
@@ -1047,6 +1078,28 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             commonHeaders += ("security-verify" to securityServer)
             registerHeaders += ("security-verify" to securityServer)
             val securityServerParams = SipSecurityServerSelector.select(securityServer).params
+
+            if (registerChallenge.realm.equals("ims.singtel.com", ignoreCase = true)) {
+                val selectedAlg = securityServerParams["alg"]
+                val selectedEalg = securityServerParams["ealg"] ?: "null"
+
+                if (selectedAlg != null) {
+                    registerSecurityClientOverride = SipSecurityClientHeader.build(
+                        ipsecSettings = ipsecSettings,
+                        clientPort = socket.gLocalPort(),
+                        serverPort = serverSocket.localPort,
+                        algs = listOf(selectedAlg),
+                        ealgs = listOf(selectedEalg),
+                    )
+                    Rlog.w(
+                        TAG,
+                        "Using SingTel selected Security-Client for protected REGISTER: " +
+                            registerSecurityClientOverride,
+                    )
+                } else {
+                    Rlog.w(TAG, "Could not narrow SingTel Security-Client: missing selected alg")
+                }
+            }
 
             portS = securityServerParams["port-s"]!!.toInt()
             // spi string is 32 bit unsigned, but ipSecManager wants an int...
@@ -1462,7 +1515,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         val writer = _writer ?: socket.gWriter()
 
         val msg = SipRegisterRequestBuilder.build(
-            realm = realm,
+            realm = registerTargetRealm,
             registerHeaders = registerHeaders,
             registerCounter = registerCounter,
             contact = contact,
@@ -1470,6 +1523,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             ipsecSettings = ipsecSettings,
             clientPort = socket.gLocalPort(),
             serverPort = serverSocket.localPort,
+            securityClientOverride = registerSecurityClientOverride,
         )
         Rlog.d(TAG, "Sending $msg")
         synchronized(writer) {

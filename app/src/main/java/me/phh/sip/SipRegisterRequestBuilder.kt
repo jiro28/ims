@@ -11,12 +11,14 @@ object SipRegisterRequestBuilder {
         ipsecSettings: SipIpsecSettings,
         clientPort: Int,
         serverPort: Int,
+        securityClientOverride: String? = null,
     ): SipRequest {
-        val secClientLine = SipSecurityClientHeader.build(
+        val defaultSecClientLine = SipSecurityClientHeader.build(
             ipsecSettings = ipsecSettings,
             clientPort = clientPort,
             serverPort = serverPort,
         )
+        val secClientLine = securityClientOverride ?: defaultSecClientLine
 
         // P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=216302ee2003a107
         return SipRequest(
