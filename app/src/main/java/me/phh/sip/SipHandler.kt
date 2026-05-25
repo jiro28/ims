@@ -2978,13 +2978,23 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     $singtelOutgoingInvitePaniLine
                     Contact: $contactTel
                     """.toSipHeadersMap() + generateCallId() - "p-asserted-identity"
+            val inviteHeaders = if (isSingTel()) {
+                // SingTel accepts sec-agree during REGISTER, but silently drops
+                // outgoing INVITE with REGISTER/sec-agree-only headers. Keep
+                // Security-Verify, because the request is still sent on the
+                // protected flow, but do not require the remote side to
+                // understand sec-agree as an INVITE extension.
+                myHeaders - "expires" - "require" - "proxy-require"
+            } else {
+                myHeaders
+            }
             // P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
             // Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
             val msg =
                 SipRequest(
                     SipMethod.INVITE,
                     to,
-                    myHeaders,
+                    inviteHeaders,
                     sdp
                 )
             val outgoingInviteCallId = msg.headers["call-id"]!![0]
