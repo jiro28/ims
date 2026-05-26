@@ -2917,7 +2917,10 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             val amrWbTrack = 98
             val dtmfNbTrack = 100
             val dtmfWbTrack = 101
-            val offerAmrWb = amrWbMediaCodecAvailable
+            // SingTel silently ignores our outgoing INVITE while AMR-WB is offered.
+            // Keep incoming AMR-WB handling intact, but make the outgoing offer
+            // conservative: AMR-NB + telephone-event/8000 only.
+            val offerAmrWb = amrWbMediaCodecAvailable && !isSingTel()
             val allTracks = if (offerAmrWb) {
                 listOf(amrWbTrack, amrNbTrack, dtmfWbTrack, dtmfNbTrack)
             } else {
