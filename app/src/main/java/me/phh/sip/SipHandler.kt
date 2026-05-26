@@ -298,13 +298,9 @@ class SipHandler(
 
     private fun outgoingInviteTargetUri(normalizedPhoneNumber: String): String {
         if (isSingTel()) {
-            val singtelInviteNumber = when {
-                normalizedPhoneNumber.startsWith("+") -> normalizedPhoneNumber
-                normalizedPhoneNumber.startsWith("65") && normalizedPhoneNumber.length == 10 -> "+$normalizedPhoneNumber"
-                normalizedPhoneNumber.length == 8 -> "+65$normalizedPhoneNumber"
-                else -> normalizedPhoneNumber
-            }
-            return "sip:$singtelInviteNumber@${singtelServiceRealm()};user=phone"
+            // stock-like phone-context target: Samsung stock sends outgoing
+            // INVITE to sip:<local>;phone-context=ims.singtel.com@ims.singtel.com;user=phone.
+            return singtelPhoneContextSipUri(normalizedPhoneNumber)
         }
 
         return if (normalizedPhoneNumber.startsWith("+")) {
