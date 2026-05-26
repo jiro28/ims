@@ -3038,8 +3038,13 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 // Security-Verify, because the request is still sent on the
                 // protected flow, but do not require the remote side to
                 // understand sec-agree as an INVITE extension.
-                (myHeaders - "expires" - "require" - "proxy-require" - "supported" - "cseq") +
-                    "Supported: 100rel, replaces, timer\nCSeq: 1 INVITE".toSipHeadersMap()
+                (myHeaders - "expires" - "require" - "proxy-require" - "supported" - "cseq" - "session-expires" - "min-se") +
+                    """
+                    Supported: timer, sec-agree, replaces
+                    Session-Expires: 1800
+                    Min-SE: 900
+                    CSeq: 1 INVITE
+                    """.toSipHeadersMap()
             } else {
                 myHeaders
             }
