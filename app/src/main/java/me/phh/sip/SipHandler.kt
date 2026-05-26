@@ -284,24 +284,24 @@ class SipHandler(
             }
         }
 
+    private fun singtelLocalNumberForUri(number: String): String {
+        val digits = number.trim().trimStart('+')
+        return if (digits.startsWith("65") && digits.length == 10) {
+            digits.substring(2)
+        } else {
+            digits
+        }
+    }
+
+    private fun singtelPhoneContextSipUri(number: String): String =
+        "sip:${singtelLocalNumberForUri(number)};phone-context=${singtelServiceRealm()}@${singtelServiceRealm()};user=phone"
+
     private fun outgoingInviteTargetUri(normalizedPhoneNumber: String): String {
         if (isSingTel()) {
-            val singtelInviteNumber = when {
-                normalizedPhoneNumber.startsWith("+") -> normalizedPhoneNumber
-                normalizedPhoneNumber.startsWith("65") && normalizedPhoneNumber.length == 10 -> "+$normalizedPhoneNumber"
-                normalizedPhoneNumber.length == 8 -> "+65$normalizedPhoneNumber"
-                else -> normalizedPhoneNumber
-            }
-            return if (singtelInviteNumber.startsWith("+")) {
-                "sip:$singtelInviteNumber@${singtelServiceRealm()};user=phone"
-            } else {
-                "sip:$singtelInviteNumber;phone-context=${singtelServiceRealm()}@${singtelServiceRealm()};user=phone"
-            }
+            return singtelPhoneContextSipUri(normalizedPhoneNumber)
         }
 
         return if (normalizedPhoneNumber.startsWith("+")) {
-            // Global TEL URIs must stand on their own. Adding phone-context to +E.164
-            // numbers makes some IMS cores drop the INVITE without any SIP response.
             "tel:$normalizedPhoneNumber"
         } else {
             "tel:$normalizedPhoneNumber;phone-context=$realm"
@@ -2997,11 +2997,12 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
             val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
             val outgoingIdentitySip =
-                if (isSingTel() && !mySip.contains(";user=phone", ignoreCase = true)) {
-                    "$mySip;user=phone"
+                if (isSingTel()) {
+                    singtelPhoneContextSipUri(myTel)
                 } else {
                     mySip
                 }
+            val outgoingPreferredIdentitySip = if (isSingTel()) mySip else outgoingIdentitySip
             val outgoingContactUser = if (isSingTel()) imsi else myTel
             val outgoingContactFeatures =
                 if (isSingTel()) {
@@ -3015,7 +3016,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 """
                     From: <$outgoingIdentitySip>
                     To: <$to>
-                    P-Preferred-Identity: <$outgoingIdentitySip>
+                    P-Preferred-Identity: <$outgoingPreferredIdentitySip>
                     P-Asserted-Identity: <$outgoingIdentitySip>
                     Expires: 7200
                     Require: sec-agree
@@ -3037,7 +3038,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 // Security-Verify, because the request is still sent on the
                 // protected flow, but do not require the remote side to
                 // understand sec-agree as an INVITE extension.
-                (myHeaders - "expires" - "require" - "proxy-require" - "supported" - "cseq" - "session-expires" - "min-se" - "p-preferred-identity" - "p-preferred-service" - "accept-contact") +
+                (myHeaders - "expires" - "require" - "proxy-require" - "supported" - "cseq" - "session-expires" - "min-se" - "p-preferred-service" - "accept-contact") +
                     """
                     Supported: timer, sec-agree, replaces
                     Session-Expires: 1800
