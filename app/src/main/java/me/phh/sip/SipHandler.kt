@@ -3027,7 +3027,6 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     "p-preferred-service" - "accept-contact" - "p-access-network-info") +
                     """
                     Supported: sec-agree
-                    P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=20810b8c49752501
                     CSeq: 1 INVITE
                     """.toSipHeadersMap()
             } else {
