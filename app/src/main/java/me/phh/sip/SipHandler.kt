@@ -256,33 +256,31 @@ class SipHandler(
     private val mnc = carrierSettings.mnc
     private val imsi = subTelephonyManager.subscriberId
 
-        private fun normalizeSingTelOutgoingSdpLine(line: String): String {
-            val normalizedAmrWbRtpmap =
-                if (line.startsWith("a=rtpmap:", ignoreCase = true) &&
-                    line.contains("AMR-WB/16000", ignoreCase = true) &&
-                    !line.contains("AMR-WB/16000/1", ignoreCase = true)
-                ) {
-                    line.replace("AMR-WB/16000", "AMR-WB/16000/1")
-                } else {
-                    line
-                }
+            private fun normalizeSingTelOutgoingSdpLine(line: String): String {
+                // SingTel network AMR SDP shape: incoming/accepted SingTel SDP uses
+                // AMR-WB/16000 without /1 and AMR fmtp max-red=0 + octet-align=0.
+                val amrWbRtpmap =
+                    if (line.startsWith("a=rtpmap:", ignoreCase = true) &&
+                        line.contains("AMR-WB/16000/1", ignoreCase = true)
+                    ) {
+                        line.replace("AMR-WB/16000/1", "AMR-WB/16000")
+                    } else {
+                        line
+                    }
 
-            val normalizedAmrFmtp =
-                if (normalizedAmrWbRtpmap.startsWith("a=fmtp:", ignoreCase = true)) {
-                    normalizedAmrWbRtpmap
-                        .replace("octet-align=0;", "")
-                        .replace(";octet-align=0", "")
-                        .replace("max-red=0", "max-red=220")
-                } else {
-                    normalizedAmrWbRtpmap
-                }
+                val amrFmtp = Regex(
+                    "^a=fmtp:(\\d+)\\s+.*mode-change-capability=2.*$",
+                    RegexOption.IGNORE_CASE,
+                ).matchEntire(amrWbRtpmap)?.let { match ->
+                    "a=fmtp:${match.groupValues[1]} max-red=0; mode-change-capability=2; octet-align=0"
+                } ?: amrWbRtpmap
 
-            return if (normalizedAmrFmtp.equals("a=maxptime:240", ignoreCase = true)) {
-                "a=maxptime:40"
-            } else {
-                normalizedAmrFmtp
+                return if (amrFmtp.equals("a=maxptime:240", ignoreCase = true)) {
+                    "a=maxptime:40"
+                } else {
+                    amrFmtp
+                }
             }
-        }
 
     private fun singtelLocalNumberForUri(number: String): String {
         val digits = number.trim().trimStart('+')
