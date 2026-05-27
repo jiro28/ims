@@ -2765,6 +2765,28 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         }
     }
 
+    private fun reconnectAfterSingTelBlackholedOutgoingInvite(reason: String) {
+        if (!isSingTel()) return
+
+        // SingTel blackholed outgoing INVITE cleanup: after an unanswered MO INVITE,
+        // the next MO MESSAGE also times out even though MT INVITE still works.
+        // Tear down and reacquire the IMS SIP/IPsec flow after sending CANCEL so
+        // SMS/call attempts do not keep using the poisoned transaction state.
+        myHandler.postDelayed({
+            if (!this::network.isInitialized) return@postDelayed
+            if (pendingOutgoingInvite != null || currentCall != null) {
+                Rlog.w(
+                    TAG,
+                    "Deferring SingTel IMS reconnect after blackholed outgoing INVITE; " +
+                        "call state still active/pending reason=$reason",
+                )
+                return@postDelayed
+            }
+
+            reconnectIms("SingTel blackholed outgoing INVITE cleanup: $reason")
+        }, 1500L)
+    }
+
     private fun sendCancelForPendingOutgoingInvite(pending: PendingOutgoingInvite, reason: String): Boolean {
         if (!pending.cancelSent.compareAndSet(false, true)) {
             Rlog.d(TAG, "CANCEL already sent for pending outgoing INVITE callId=${pending.callId} reason=$reason")
@@ -2809,6 +2831,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             closeRtpSocket = true,
             reason = "sent CANCEL for pending outgoing INVITE",
         )
+        reconnectAfterSingTelBlackholedOutgoingInvite(reason)
         return true
     }
 
