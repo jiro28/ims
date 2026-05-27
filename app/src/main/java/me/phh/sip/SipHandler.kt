@@ -3118,6 +3118,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
                     Content-Type: application/sdp
                     P-Early-Media: supported
+                    P-Asserted-Identity: <sip:$myTel@${outgoingServiceRealm()}>
                     Min-SE: 900
                     Session-Expires: 1800
                     Accept: application/sdp
