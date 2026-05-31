@@ -3920,9 +3920,14 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 val amrFrame = SipAmrRtpPayload.storageFrameFromBandwidthEfficientRtp(audioCodec, dgramBuf, dgram.length)
                 val ftForLog = amrFrame?.ft ?: 15
 
-                if (receivedCount <= 10 || receivedCount % 50 == 0) {
-                    Rlog.d(TAG, "Received RTP packet #$receivedCount: from=${dgram.address}:${dgram.port} length=${dgram.length} pt=$pt ft=$ftForLog codecBytes=${amrFrame?.codecFrame?.size ?: 0}")
-                }
+                SipRtpPacketLogger.logReceivedPacket(
+                    logTag = TAG,
+                    receivedCount = receivedCount,
+                    packet = dgram,
+                    payloadType = pt,
+                    frameType = ftForLog,
+                    codecFrameSize = amrFrame?.codecFrame?.size ?: 0,
+                )
 
                 if (amrFrame == null) continue
 
