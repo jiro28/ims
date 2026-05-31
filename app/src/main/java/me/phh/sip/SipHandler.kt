@@ -3862,10 +3862,11 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             // send sparse SID/CN frames after DTMF; writing only when RTP arrives
             // lets AudioTrack underrun and sounds like heavy stutter. Keep a tiny
             // 20ms playout loop and feed silence when the decoder has no PCM ready.
-            val downlinkFrameBytes = ((audioCodec.sampleRate / 50) * audioCodec.channelCount * 2).coerceAtLeast(320)
-            val downlinkSilenceFrame = ByteArray(downlinkFrameBytes)
-            val downlinkPcmQueue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(8)
-            val downlinkPlayoutRunning = java.util.concurrent.atomic.AtomicBoolean(true)
+            val downlinkPlayoutBuffers = SipDownlinkPcmPlayoutBuffers.create(audioCodec)
+            val downlinkFrameBytes = downlinkPlayoutBuffers.frameBytes
+            val downlinkSilenceFrame = downlinkPlayoutBuffers.silenceFrame
+            val downlinkPcmQueue = downlinkPlayoutBuffers.pcmQueue
+            val downlinkPlayoutRunning = downlinkPlayoutBuffers.running
             val downlinkPlayoutThread = thread(name = "PhhDownlinkPcmPlayout") {
                 var fillerFrames = 0
                 var nextWriteAtMs = android.os.SystemClock.elapsedRealtime() + 60L
