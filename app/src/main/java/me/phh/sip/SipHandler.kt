@@ -406,15 +406,6 @@ private val smsHandler = SipSmsHandler(
     }
 
     
-    private fun sendRtpPacket(
-        rtpSocket: DatagramSocket,
-        bytes: ByteArray,
-        remoteAddr: InetAddress,
-        remotePort: Int,
-        label: String,
-    ): Boolean {
-        return RtpPacketSender.send(TAG, rtpSocket, bytes, remoteAddr, remotePort, label)
-    }
 
 fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         dispatcher.setRequestCallback(method, cb)
@@ -2194,7 +2185,14 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     timestamp = timestamp,
                 )
                 try {
-                    if (!sendRtpPacket(sendCall.rtpSocket, buf, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort, "RTP packet #$sequenceNumber")) throw IOException("RTP send failed")
+                    if (!RtpPacketSender.send(
+                        tag = TAG,
+                        rtpSocket = sendCall.rtpSocket,
+                        bytes = buf,
+                        remoteAddr = sendCall.rtpRemoteAddr,
+                        remotePort = sendCall.rtpRemotePort,
+                        label = "RTP packet #$sequenceNumber",
+                    )) throw IOException("RTP send failed")
                 } catch (e: Exception) {
                     Rlog.w(TAG, "Silence RTP send failed, stopping encode thread: ${e.message}", e)
                     encoder.stop()
@@ -2238,7 +2236,14 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                         timestamp = timestamp,
                     )
                     try {
-                        if (!sendRtpPacket(sendCall.rtpSocket, buf, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort, "incoming RTP settle silence #$sequenceNumber")) {
+                        if (!RtpPacketSender.send(
+                            tag = TAG,
+                            rtpSocket = sendCall.rtpSocket,
+                            bytes = buf,
+                            remoteAddr = sendCall.rtpRemoteAddr,
+                            remotePort = sendCall.rtpRemotePort,
+                            label = "incoming RTP settle silence #$sequenceNumber",
+                        )) {
                             throw IOException("RTP send failed")
                         }
                     } catch (e: Exception) {
@@ -2401,7 +2406,14 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                         }
                         firstPacket = false
                         try {
-                            if (!sendRtpPacket(sendCall.rtpSocket, buf, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort, "RTP packet #$sequenceNumber")) throw IOException("RTP send failed")
+                            if (!RtpPacketSender.send(
+                                tag = TAG,
+                                rtpSocket = sendCall.rtpSocket,
+                                bytes = buf,
+                                remoteAddr = sendCall.rtpRemoteAddr,
+                                remotePort = sendCall.rtpRemotePort,
+                                label = "RTP packet #$sequenceNumber",
+                            )) throw IOException("RTP send failed")
                             if (realFrameCount < 10) {
                                 Rlog.d(TAG, "Sent RTP packet #$sequenceNumber ft=$ft ts=$timestamp payload=${buf.drop(12).take(4).joinToString(" ") { "%02x".format(it) }}... to ${sendCall.rtpRemoteAddr}:${sendCall.rtpRemotePort}")
                             }
@@ -4054,7 +4066,14 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                         duration = duration,
                         repeatIndex = index,
                     )
-                    if (!sendRtpPacket(sendCall.rtpSocket, buf, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort, "RTP DTMF event=$event char=$c seq=$sequenceNumber ts=$timestamp duration=$duration end=${index >= 3}")) return@thread
+                    if (!RtpPacketSender.send(
+                        tag = TAG,
+                        rtpSocket = sendCall.rtpSocket,
+                        bytes = buf,
+                        remoteAddr = sendCall.rtpRemoteAddr,
+                        remotePort = sendCall.rtpRemotePort,
+                        label = "RTP DTMF event=$event char=$c seq=$sequenceNumber ts=$timestamp duration=$duration end=${index >= 3}",
+                    )) return@thread
                     Thread.sleep(20)
                 }
             } catch (t: Throwable) {
