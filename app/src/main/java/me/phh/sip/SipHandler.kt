@@ -816,9 +816,6 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
 
 
     
-    private fun ratName(rat: Int): String =
-        ImsNetworkState.ratName(rat)
-
     private fun isRatReadyForImsNetworkRequest(): Boolean =
         ImsNetworkState.isRatReadyForImsNetworkRequest(TAG, subTelephonyManager)
 
@@ -3041,9 +3038,6 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             digits
         }
     }
-
-    private fun singtelStockPhoneContextSipUri(number: String): String =
-        "sip:${singtelStockLocalNumberForPhoneContext(number)};phone-context=ims.singtel.com@ims.singtel.com;user=phone"
 
     private fun singtelPublicSipUri(number: String): String {
         val digits = singtelStockLocalNumberForPhoneContext(number)
