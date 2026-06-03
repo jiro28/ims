@@ -212,7 +212,23 @@ class SipHandler(
                 .firstOrNull()
                 .orEmpty()
 
-            synchronized(serverSocketUdp.socket) {
+            val channel = serverSocketUdp.socket.channel
+            if (channel != null) {
+                val sent = channel.send(
+                    java.nio.ByteBuffer.wrap(bytes),
+                    java.net.InetSocketAddress(remoteAddress, remotePort),
+                )
+                if (sent != bytes.size) {
+                    Rlog.w(
+                        TAG,
+                        "UDP SIP response partial send bytes=$sent expected=${bytes.size} " +
+                            "target=$remoteAddress:$remotePort firstLine=$firstLine",
+                    )
+                }
+            } else {
+                // Fallback for sockets not backed by a DatagramChannel. This can still
+                // contend with receive(), but keeps the writer functional on all socket
+                // construction paths.
                 serverSocketUdp.socket.send(
                     DatagramPacket(bytes, bytes.size, remoteAddress, remotePort),
                 )
@@ -2494,6 +2510,8 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             val responseWriter = call.incomingResponseWriter ?: socket.gWriter()
             val responseBytes = msg3.toByteArray()
             Rlog.d(TAG, "Sending $msg3 via incomingResponseWriter=${call.incomingResponseWriter != null}")
+                incomingFinalResponseSent.set(true)
+                incomingAcceptedAwaitingAck.set(true)
                 if (!writeSipBytes(responseWriter, responseBytes, "incoming INVITE final 200 OK callId=$acceptedCallId")) {
                     incomingFinalResponseSent.set(false)
                     incomingAcceptedAwaitingAck.set(false)
@@ -2529,7 +2547,10 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     val stillSameCall = currentCall?.callIdOrNull() == acceptedCallId
                     if (!incomingAcceptedAwaitingAck.get() || !stillSameCall) break
                     Rlog.w(TAG, "Retransmitting incoming 200 OK waiting for ACK callId=$acceptedCallId elapsed=${elapsedMs}ms")
-                    if (!writeSipBytes(responseWriter, responseBytes, "incoming INVITE final 200 OK retransmit callId=$acceptedCallId elapsed=${elapsedMs}ms")) {
+                    val retransmitWriter =
+                        currentCall?.takeIf { it.callIdOrNull() == acceptedCallId }?.incomingResponseWriter
+                            ?: responseWriter
+                    if (!writeSipBytes(retransmitWriter, responseBytes, "incoming INVITE final 200 OK retransmit callId=$acceptedCallId elapsed=${elapsedMs}ms")) {
                         Rlog.w(TAG, "Stopping incoming 200 OK retransmit after write failure callId=$acceptedCallId elapsed=${elapsedMs}ms")
                         incomingAcceptedAwaitingAck.set(false)
                         incomingHangupAfterAck.set(false)
@@ -4047,16 +4068,81 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         if (isInDialogInvite) {
             return handleInDialogInvite(request, existingCall!!, incomingResponseWriter)
         }
-        if (existingCall != null && !existingCall.outgoing && existingCall.callIdOrEmpty() == incomingCallId) {
+                if (existingCall != null && !existingCall.outgoing && existingCall.callIdOrEmpty() == incomingCallId) {
             val incomingCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
+            val duplicateAnswered = incomingFinalResponseSent.get() || incomingAcceptedAwaitingAck.get()
+            val refreshedHeaders = responseHeadersFromRequest(
+                request = request,
+                toOverride = existingCall.callHeaders["to"],
+            )
+            val refreshedCall = existingCall.copy(
+                callHeaders = existingCall.callHeaders + refreshedHeaders,
+                incomingResponseWriter = incomingResponseWriter,
+            )
+            currentCall = refreshedCall
+
             Rlog.w(
                 TAG,
                 "Refreshing duplicate incoming INVITE for existing incoming dialog: " +
-                    "callId=$incomingCallId cseq=$incomingCseq",
+                    "callId=$incomingCallId cseq=$incomingCseq " +
+                    "finalResponseSent=${incomingFinalResponseSent.get()} " +
+                    "awaitingAck=${incomingAcceptedAwaitingAck.get()} callStarted=${callStarted.get()}",
             )
-            // The original pending incoming dialog already notified Telecom.
-            // Do not create another ImsCallSession for the same network Call-ID;
-            // return 100 so parseMessage answers the retransmit on this flow.
+
+            if (duplicateAnswered) {
+                val duplicateFinalBody = completeIncomingPreconditionAnswerSdp(refreshedCall.sdp, incomingCallId)
+                val duplicateFinalCall = if (!duplicateFinalBody.contentEquals(refreshedCall.sdp)) {
+                    refreshedCall.copy(sdp = duplicateFinalBody)
+                } else {
+                    refreshedCall
+                }
+                currentCall = duplicateFinalCall
+
+                val duplicateFinalHeaders =
+                    duplicateFinalCall.callHeaders -
+                        "rseq" -
+                        "security-verify" -
+                        "p-access-network-info" -
+                        "content-type" -
+                        "content-length" +
+                        """
+                        Session-Expires: 1800;refresher=uas
+                        Contact: ${duplicateFinalCall.callHeaders["contact"]!!.first()}
+                        Content-Type: application/sdp
+                        Content-Length: ${duplicateFinalBody.size}
+                        """.toSipHeadersMap()
+
+                val duplicateFinalResponse = SipResponse(
+                    statusCode = 200,
+                    statusString = "OK",
+                    headersParam = duplicateFinalHeaders,
+                    body = duplicateFinalBody,
+                    autofill = false,
+                )
+                val duplicateFinalBytes = duplicateFinalResponse.toByteArray()
+                Rlog.w(
+                    TAG,
+                    "Re-sending final 200 OK on duplicate incoming INVITE transaction: " +
+                        "callId=$incomingCallId cseq=$incomingCseq bytes=${duplicateFinalBytes.size}",
+                )
+                if (writeSipBytes(
+                        incomingResponseWriter,
+                        duplicateFinalBytes,
+                        "duplicate incoming INVITE final 200 OK callId=$incomingCallId cseq=$incomingCseq",
+                    )
+                ) {
+                    incomingFinalResponseSent.set(true)
+                    incomingAcceptedAwaitingAck.set(true)
+                } else {
+                    Rlog.w(
+                        TAG,
+                        "Failed to send final 200 OK on duplicate incoming INVITE transaction: " +
+                            "callId=$incomingCallId cseq=$incomingCseq",
+                    )
+                }
+                return 0
+            }
+
             return 100
         }
 
