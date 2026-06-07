@@ -1441,6 +1441,35 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         failConnectAndRetry("Authenticated SIP REGISTER did not return 200")
     }
 
+
+    private fun readAndHandleAuthenticatedRegisterResponse(
+        registerRealmDecision: SipRegisterNegotiationPolicy.RegisterRealmDecision,
+        registerChallenge: SipRegisterChallenge,
+        akaResult: SipAkaResult,
+    ) {
+        Rlog.d(TAG, "Waiting for authenticated SIP REGISTER response")
+        val regReply = readRegisterReplyOrRetry(
+            readFailureLog = "Authenticated SIP REGISTER response read failed, aborting SIP",
+            readFailureReason = "Authenticated SIP REGISTER response read failed",
+            noResponseLog = "Authenticated SIP REGISTER got EOF/no response, aborting SIP",
+            noResponseReason = "Authenticated SIP REGISTER got EOF/no response",
+            readReply = { readAuthenticatedRegisterReply() },
+        ) ?: return
+        Rlog.d(TAG, "Received $regReply")
+
+        if (regReply !is SipResponse || regReply.statusCode != 200) {
+            handleAuthenticatedRegisterFailure(
+                regReply = regReply,
+                registerRealmDecision = registerRealmDecision,
+                registerChallenge = registerChallenge,
+                akaResult = akaResult,
+            )
+            return
+        }
+
+        handleAuthenticatedRegisterSuccess(regReply)
+    }
+
     fun connect() {
         if (!prepareImsEndpointForConnect()) {
             return
@@ -1494,27 +1523,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         )
         connectProtectedSipSocketAndRegister(portS)
 
-        Rlog.d(TAG, "Waiting for authenticated SIP REGISTER response")
-        val regReply = readRegisterReplyOrRetry(
-            readFailureLog = "Authenticated SIP REGISTER response read failed, aborting SIP",
-            readFailureReason = "Authenticated SIP REGISTER response read failed",
-            noResponseLog = "Authenticated SIP REGISTER got EOF/no response, aborting SIP",
-            noResponseReason = "Authenticated SIP REGISTER got EOF/no response",
-            readReply = { readAuthenticatedRegisterReply() },
-        ) ?: return
-        Rlog.d(TAG, "Received $regReply")
-
-        if (regReply !is SipResponse || regReply.statusCode != 200) {
-            handleAuthenticatedRegisterFailure(
-                regReply = regReply,
-                registerRealmDecision = registerRealmDecision,
-                registerChallenge = registerChallenge,
-                akaResult = akaResult,
-            )
-            return
-        }
-
-        handleAuthenticatedRegisterSuccess(regReply)
+        readAndHandleAuthenticatedRegisterResponse(
+            registerRealmDecision = registerRealmDecision,
+            registerChallenge = registerChallenge,
+            akaResult = akaResult,
+        )
     }
 
     private fun startSipReaderLoops() {
