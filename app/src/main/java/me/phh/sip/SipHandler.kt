@@ -2189,6 +2189,43 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         )
     }
 
+
+    private fun updateTrackRequirements(
+        attributes: List<String>,
+        track: Int,
+    ): String? {
+        return attributes.firstOrNull { it.startsWith("fmtp:$track") }
+    }
+
+    private fun lookUpdateTrackMatching(
+        attributes: List<String>,
+        offeredPayloads: Set<Int>,
+        codec: String,
+        additional: String = "",
+        notAdditional: String = "",
+    ): Pair<Int, String>? {
+        val maps = attributes.filter { it.startsWith("rtpmap:") && it.contains(codec) }
+        val matches = maps.mapNotNull { m ->
+            val track = m.split("[: ]+".toRegex()).getOrNull(1)?.toIntOrNull()
+            if (track != null && offeredPayloads.contains(track)) Pair(track, m) else null
+        }
+        val sorted = matches.sortedBy { m ->
+            val fmtp = updateTrackRequirements(attributes, m.first).orEmpty()
+            when {
+                // Our RTP encoder currently sends AMR-NB bandwidth-efficient frames.
+                // SDP without octet-align defaults to octet-align=0, so prefer that
+                // over octet-align=1 when carriers offer both forms in UPDATE.
+                codec.startsWith("AMR") && fmtp.contains("octet-align=1", ignoreCase = true) -> 100
+                codec.startsWith("AMR") && fmtp.isEmpty() -> 0
+                notAdditional.isNotEmpty() && fmtp.contains(notAdditional, ignoreCase = true) -> 90
+                additional.isNotEmpty() && fmtp.contains(additional, ignoreCase = true) -> 0
+                else -> 10
+            }
+        }
+        Rlog.d(TAG, "UPDATE matching $codec offered=$offeredPayloads got=$sorted")
+        return sorted.firstOrNull()
+    }
+
     fun handleUpdate(request: SipRequest): Int {
         val requestCallId = request.callIdOrEmpty()
         val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
@@ -2226,51 +2263,29 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val offeredPayloads = updateSdpOffer.offeredPayloads
         val attributes = updateSdpOffer.attributes
 
-        fun trackRequirements(track: Int): String? {
-            return attributes.firstOrNull { it.startsWith("fmtp:$track") }
-        }
-
-        fun lookTrackMatching(
-            codec: String,
-            additional: String = "",
-            notAdditional: String = "",
-        ): Pair<Int, String>? {
-            val maps = attributes.filter { it.startsWith("rtpmap:") && it.contains(codec) }
-            val matches = maps.mapNotNull { m ->
-                val track = m.split("[: ]+".toRegex()).getOrNull(1)?.toIntOrNull()
-                if (track != null && offeredPayloads.contains(track)) Pair(track, m) else null
-            }
-            val sorted = matches.sortedBy { m ->
-                val fmtp = trackRequirements(m.first).orEmpty()
-                when {
-                    // Our RTP encoder currently sends AMR-NB bandwidth-efficient frames.
-                    // SDP without octet-align defaults to octet-align=0, so prefer that
-                    // over octet-align=1 when carriers offer both forms in UPDATE.
-                    codec.startsWith("AMR") && fmtp.contains("octet-align=1", ignoreCase = true) -> 100
-                    codec.startsWith("AMR") && fmtp.isEmpty() -> 0
-                    notAdditional.isNotEmpty() && fmtp.contains(notAdditional, ignoreCase = true) -> 90
-                    additional.isNotEmpty() && fmtp.contains(additional, ignoreCase = true) -> 0
-                    else -> 10
-                }
-            }
-            Rlog.d(TAG, "UPDATE matching $codec offered=$offeredPayloads got=$sorted")
-            return sorted.firstOrNull()
-        }
-
         // Keep the selected speech payload first in SDP answers. Sorting payload IDs can
         // put telephone-event before AMR-WB, e.g. m=audio ... 96 104, which some
         // IMS cores reject as an offer/answer error during precondition UPDATE.
         val selectedAudioCodec = call.audioCodec
-        val amr = lookTrackMatching(SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec), notAdditional = "octet-align=1")
+        val amr = lookUpdateTrackMatching(
+            attributes = attributes,
+            offeredPayloads = offeredPayloads,
+            codec = SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec),
+            notAdditional = "octet-align=1",
+        )
         if (amr == null) {
             Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
             return 488
         }
         val (amrTrack, amrTrackDesc) = amr
-        val amrFmtpAnswer = trackRequirements(amrTrack)
+        val amrFmtpAnswer = updateTrackRequirements(attributes, amrTrack)
             ?: SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(amrTrack, selectedAudioCodec)
 
-        val dtmf = lookTrackMatching(SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec))
+        val dtmf = lookUpdateTrackMatching(
+            attributes = attributes,
+            offeredPayloads = offeredPayloads,
+            codec = SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec),
+        )
         if (dtmf == null) {
             Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
             return 488
