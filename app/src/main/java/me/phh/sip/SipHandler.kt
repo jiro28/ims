@@ -1487,6 +1487,28 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         )
     }
 
+
+    private data class PlainRegisterChallengeResult(
+        val plainRegReply: SipResponse,
+        val registerChallenge: SipRegisterChallenge,
+    )
+
+    private fun readPlainRegisterChallenge(): PlainRegisterChallengeResult? {
+        val plainRegReply = requirePlainRegisterChallengeResponse(
+            readPlainRegisterReply(plainSocket),
+        ) ?: return null
+
+        val registerChallenge = SipRegisterChallengeParser.parse(
+            response = plainRegReply,
+            fallbackRealm = realm,
+        )
+
+        return PlainRegisterChallengeResult(
+            plainRegReply = plainRegReply,
+            registerChallenge = registerChallenge,
+        )
+    }
+
     fun connect() {
         if (!prepareImsEndpointForConnect()) {
             return
@@ -1502,14 +1524,9 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         setupPlainSipSocketsAndSendInitialRegister()
 
-        var plainRegReply = requirePlainRegisterChallengeResponse(
-            readPlainRegisterReply(plainSocket),
-        ) ?: return
-
-        var registerChallenge = SipRegisterChallengeParser.parse(
-            response = plainRegReply,
-            fallbackRealm = realm,
-        )
+        val plainRegisterChallenge = readPlainRegisterChallenge() ?: return
+        var plainRegReply = plainRegisterChallenge.plainRegReply
+        var registerChallenge = plainRegisterChallenge.registerChallenge
         val akaChallengeResult = resolveAkaRegisterChallenge(
             plainRegReply = plainRegReply,
             registerChallenge = registerChallenge,
