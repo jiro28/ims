@@ -1405,6 +1405,17 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         failConnectAndRetry("Canonical REGISTER realm retry did not return 200")
     }
 
+
+    private fun allocateClientIpsecSettingsForRegister(): SipIpsecSettings {
+        val clientSpiC = allocateSecurityParameterIndexWithWatchdog("client SPI-C", localAddr)
+        val clientSpiS = allocateSecurityParameterIndexWithWatchdog("client SPI-S", localAddr, clientSpiC.spi + 1)
+
+        return SipIpsecSettings(
+            clientSpiS = clientSpiS,
+            clientSpiC = clientSpiC,
+        )
+    }
+
     fun connect() {
         if (!prepareImsEndpointForConnect()) {
             return
@@ -1412,12 +1423,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         Rlog.w(TAG, "Connecting with address ${imsDualSimDebugContext("selectedLocal=$localAddr selectedPcscf=$pcscfAddr")}")
 
-        val clientSpiC = allocateSecurityParameterIndexWithWatchdog("client SPI-C", localAddr)
-        val clientSpiS = allocateSecurityParameterIndexWithWatchdog("client SPI-S", localAddr, clientSpiC.spi + 1)
-        ipsecSettings = SipIpsecSettings(
-            clientSpiS = clientSpiS,
-            clientSpiC = clientSpiC)
+        val clientIpsecSettings = allocateClientIpsecSettingsForRegister()
+        ipsecSettings = clientIpsecSettings
         ipsecResourcesClosed = false
+        val clientSpiC = clientIpsecSettings.clientSpiC
+        val clientSpiS = clientIpsecSettings.clientSpiS
 
         setupPlainSipSocketsAndSendInitialRegister()
 
