@@ -2298,6 +2298,27 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         return answerSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
     }
 
+
+    private fun okUpdateWithSdpResponse(
+        request: SipRequest,
+        callId: String,
+        answerSdp: ByteArray,
+    ): SipResponse {
+        return SipResponse(
+            statusCode = 200,
+            statusString = "OK",
+            headersParam = request.headers.filter { (k, _) ->
+                k in listOf("cseq", "via", "from", "to", "call-id")
+            } + """
+                Content-Type: application/sdp
+                Supported: 100rel, replaces, timer
+                Require: precondition
+                Call-ID: $callId
+            """.toSipHeadersMap(),
+            body = answerSdp,
+        )
+    }
+
     fun handleUpdate(request: SipRequest): Int {
         val requestCallId = request.callIdOrEmpty()
         val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
@@ -2395,18 +2416,10 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 ?: call.remoteContact,
         )
 
-        val reply = SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = request.headers.filter { (k, _) ->
-                k in listOf("cseq", "via", "from", "to", "call-id")
-            } + """
-                Content-Type: application/sdp
-                Supported: 100rel, replaces, timer
-                Require: precondition
-                Call-ID: ${currentCall!!.callIdOrEmpty()}
-            """.toSipHeadersMap(),
-            body = answerSdp,
+        val reply = okUpdateWithSdpResponse(
+            request = request,
+            callId = currentCall!!.callIdOrEmpty(),
+            answerSdp = answerSdp,
         )
         writeUpdateReply(updateResponseWriter, reply)
 
