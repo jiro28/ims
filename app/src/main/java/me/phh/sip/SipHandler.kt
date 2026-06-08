@@ -1041,7 +1041,56 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
     var abandonnedBecauseOfNoPcscf = false
     @Synchronized
-    fun connect() {
+
+    private fun readPlainRegisterReply(plainSocket: SipConnection): SipMessage? {
+        return if (plainSocket is SipConnectionTcp) {
+            plainSocket.gReader().parseMessage()
+        } else {
+            // In some IMS servers, in UDP send mode, message might come back to plainSocket or to serverSocketUdp
+            if (select(listOf(serverSocketUdp.getChannel(), plainSocket.getChannel())) == 0)
+                serverSocketUdp.gReader().parseMessage()
+            else
+                plainSocket.gReader().parseMessage()
+        }
+    }
+
+
+    private fun handleAuthenticatedRegisterSuccess(regReply: SipResponse) {
+        reconnectController.markConnected()
+
+        installSipCallbacks()
+        handleResponse(regReply)
+
+        startSipReaderLoops()
+    }
+
+
+    private fun readRegisterReplyOrRetry(
+        readFailureLog: String,
+        readFailureReason: String,
+        noResponseLog: String,
+        noResponseReason: String,
+        readReply: () -> SipMessage?,
+    ): SipMessage? {
+        val reply = try {
+            readReply()
+        } catch (t: Throwable) {
+            Rlog.w(TAG, readFailureLog, t)
+            failConnectAndRetry(readFailureReason)
+            return null
+        }
+
+        if (reply == null) {
+            Rlog.w(TAG, noResponseLog)
+            failConnectAndRetry(noResponseReason)
+            return null
+        }
+
+        return reply
+    }
+
+
+    private fun prepareImsEndpointForConnect(): Boolean {
         abandonnedBecauseOfNoPcscf = false
         resetRegistrationStateForConnect()
         Rlog.d(TAG, "Trying to connect to SIP server ${imsDualSimDebugContext()}")
@@ -1051,7 +1100,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             Rlog.w(TAG, "No link properties for IMS network")
             imsFailureCallback?.invoke()
             scheduleImsNetworkRequestRestart("No link properties for current IMS network")
-            return
+            return false
         }
         imsRegistrationTech = detectRegistrationTech(lp)
         Rlog.d(TAG, "IMS registration tech ${registrationTechName(imsRegistrationTech)} interface=${lp.interfaceName} caps=${connectivityManager.getNetworkCapabilities(network)}")
@@ -1064,30 +1113,26 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
             ImsNetworkEndpointResolution.WaitingForPcscf -> {
                 abandonnedBecauseOfNoPcscf = true
-                return
+                return false
             }
 
             ImsNetworkEndpointResolution.NoLocalAddress -> {
                 failConnectAndRetry("No usable local address on IMS link properties")
-                return
+                return false
             }
         }
 
-        Rlog.w(TAG, "Connecting with address ${imsDualSimDebugContext("selectedLocal=$localAddr selectedPcscf=$pcscfAddr")}")
+        return true
+    }
 
-        val clientSpiC = allocateSecurityParameterIndexWithWatchdog("client SPI-C", localAddr)
-        val clientSpiS = allocateSecurityParameterIndexWithWatchdog("client SPI-S", localAddr, clientSpiC.spi + 1)
-        ipsecSettings = SipIpsecSettings(
-            clientSpiS = clientSpiS,
-            clientSpiC = clientSpiC)
-        ipsecResourcesClosed = false
 
+    private fun setupPlainSipSocketsAndSendInitialRegister() {
         plainSocket = if (isControlSocketUdp)
             SipConnectionUdp(network, pcscfAddr, localAddr)
         else
             SipConnectionTcp(network, pcscfAddr, localAddr)
         connectSipSocketWithWatchdog(plainSocket, 5060, "plain initial")
-        socket = if(plainSocket is SipConnectionTcp)
+        socket = if (plainSocket is SipConnectionTcp)
                 SipConnectionTcp(network, pcscfAddr, plainSocket.gLocalAddr())
             else
                 SipConnectionUdp(network, pcscfAddr, plainSocket.gLocalAddr())
@@ -1099,124 +1144,88 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         Rlog.d(TAG, "SIP ports ${imsDualSimDebugContext("src=${socket.gLocalPort()} tcpServer=${serverSocket.localPort} udpServer=${serverSocketUdp.localPort}")}")
         updateCommonHeaders(plainSocket)
         register(plainSocket.gWriter())
-        fun readPlainRegisterReply(): SipMessage? {
-            return if (plainSocket is SipConnectionTcp) {
-                plainSocket.gReader().parseMessage()
-            } else {
-                // In some IMS servers, in UDP send mode, message might come back to plainSocket or to serverSocketUdp
-                if (select(listOf(serverSocketUdp.getChannel(), plainSocket.getChannel())) == 0)
-                    serverSocketUdp.gReader().parseMessage()
-                else
-                    plainSocket.gReader().parseMessage()
-            }
-        }
+    }
 
-        var plainRegReply = readPlainRegisterReply()
+
+    private fun requirePlainRegisterChallengeResponse(plainRegReply: SipMessage?): SipResponse? {
         Rlog.d(TAG, "Received $plainRegReply")
 
         if (plainRegReply !is SipResponse || plainRegReply.statusCode != 401) {
             Rlog.w(TAG, "Didn't get expected response from initial register, aborting")
             plainSocket.close()
             failConnectAndRetry("Initial SIP REGISTER did not return 401")
-            return
+            return null
         }
 
-        var registerChallenge = SipRegisterChallengeParser.parse(
-            response = plainRegReply,
-            fallbackRealm = realm,
-        )
-        Rlog.d(TAG, "Requesting AKA challenge")
-        val akaResult = when (val result = sipAkaChallengeForRegistration(subTelephonyManager, registerChallenge.nonceB64)) {
-            is SipAkaChallengeResult.Success -> result.akaResult
-            is SipAkaChallengeResult.SynchronizationFailure -> {
-                Rlog.w(TAG, "AKA AUTS synchronization failure; sending one resynchronization REGISTER")
-                akaDigest = SipRegistrationDigestFactory.createSynchronizationFailure(
-                    user = user,
-                    realm = registerChallenge.realm,
-                    uri = "sip:$realm",
-                    nonceB64 = registerChallenge.nonceB64,
-                    opaque = registerChallenge.opaque,
-                    auts = result.auts,
-                    useNonsessAka = requireNonsessAka || registerChallenge.qop == null,
-                )
-                register(plainSocket.gWriter())
+        return plainRegReply
+    }
 
-                val resyncReply = readPlainRegisterReply()
-                Rlog.d(TAG, "Received after AKA AUTS resynchronization $resyncReply")
-                if (resyncReply !is SipResponse || resyncReply.statusCode != 401) {
-                    Rlog.w(TAG, "Didn't get expected 401 after AKA AUTS resynchronization, aborting")
-                    plainSocket.close()
-                    failConnectAndRetry("AKA AUTS resynchronization REGISTER did not return fresh 401")
-                    return
-                }
 
-                plainRegReply = resyncReply
-                registerChallenge = SipRegisterChallengeParser.parse(
-                    response = plainRegReply,
-                    fallbackRealm = realm,
-                )
-                Rlog.d(TAG, "Requesting AKA challenge after AUTS resynchronization")
-                when (val retryResult = sipAkaChallengeForRegistration(subTelephonyManager, registerChallenge.nonceB64)) {
-                    is SipAkaChallengeResult.Success -> retryResult.akaResult
-                    is SipAkaChallengeResult.SynchronizationFailure -> {
-                        Rlog.w(TAG, "AKA still returns AUTS after one resynchronization REGISTER; aborting")
-                        plainSocket.close()
-                        failConnectAndRetry("AKA still out of sync after AUTS resynchronization")
-                        return
-                    }
-                }
-            }
-        }
-
-        plainSocket.close()
-
-        val registerRealmDecision = SipRegisterNegotiationPolicy.registerRealmDecision(
+    private fun applyRegisterRealmDecision(challengeRealm: String) =
+        SipRegisterNegotiationPolicy.registerRealmDecision(
             defaultRealm = realm,
-            challengeRealm = registerChallenge.realm,
+            challengeRealm = challengeRealm,
             preferCanonicalAfterPromoted494 = preferCanonicalRegisterRealmAfter494,
-        )
-        val registerDigestUriRealm = registerRealmDecision.targetRealm
-        if (registerRealmDecision.forcedCanonical && registerRealmDecision.hasPromotedCandidate) {
-            Rlog.w(
-                TAG,
-                "Keeping challenged REGISTER realm auth-only after previous promoted 494 success: " +
-                    "oldUri=sip:$realm promotedUri=sip:${registerRealmDecision.candidateRealm} " +
-                    "challengeRealm=${registerChallenge.realm}",
-            )
-        } else if (registerRealmDecision.usesPromotedChallengeRealm) {
-            Rlog.w(
-                TAG,
-                "Using challenged REGISTER realm as request/digest URI: " +
-                    "oldUri=sip:$realm newUri=sip:$registerDigestUriRealm " +
-                    "challengeRealm=${registerChallenge.realm}",
-            )
-        }
-        registerTargetRealm = registerDigestUriRealm
-        registerSecurityClientOverride =
-            if (registerTargetRealm != realm) {
-                selectedSecurityClientForPromotedRegister?.also {
-                    Rlog.w(
-                        TAG,
-                        "Applying selected Security-Client for promoted REGISTER target: " +
-                            "defaultRealm=$realm targetRealm=$registerTargetRealm securityClient=$it",
-                    )
-                }
-            } else {
-                null
+        ).also { registerRealmDecision ->
+            val registerDigestUriRealm = registerRealmDecision.targetRealm
+            if (registerRealmDecision.forcedCanonical && registerRealmDecision.hasPromotedCandidate) {
+                Rlog.w(
+                    TAG,
+                    "Keeping challenged REGISTER realm auth-only after previous promoted 494 success: " +
+                        "oldUri=sip:$realm promotedUri=sip:${registerRealmDecision.candidateRealm} " +
+                        "challengeRealm=$challengeRealm",
+                )
+            } else if (registerRealmDecision.usesPromotedChallengeRealm) {
+                Rlog.w(
+                    TAG,
+                    "Using challenged REGISTER realm as request/digest URI: " +
+                        "oldUri=sip:$realm newUri=sip:$registerDigestUriRealm " +
+                        "challengeRealm=$challengeRealm",
+                )
             }
-        akaDigest = SipRegistrationDigestFactory.create(
-            user = user,
-            realm = registerChallenge.realm,
-            uri = "sip:$registerDigestUriRealm",
-            nonceB64 = registerChallenge.nonceB64,
-            opaque = registerChallenge.opaque,
-            akaResult = akaResult,
-            useNonsessAka = requireNonsessAka || registerChallenge.qop == null,
-        )
+            registerTargetRealm = registerDigestUriRealm
+            registerSecurityClientOverride =
+                if (registerTargetRealm != realm) {
+                    selectedSecurityClientForPromotedRegister?.also {
+                        Rlog.w(
+                            TAG,
+                            "Applying selected Security-Client for promoted REGISTER target: " +
+                                "defaultRealm=$realm targetRealm=$registerTargetRealm securityClient=$it",
+                        )
+                    }
+                } else {
+                    null
+                }
+        }
 
+
+    private fun readAuthenticatedRegisterReply(): SipMessage? {
+        return if (socket is SipConnectionTcp) {
+            socket.gReader().parseMessage()
+        } else if (socket is SipConnectionUdp) {
+            serverSocketUdp.gReader().parseMessage()
+        } else {
+            socket.gReader().parseMessage()
+        }
+    }
+
+
+    private fun connectProtectedSipSocketAndRegister(portS: Int) {
+        connectSipSocketWithWatchdog(socket, portS, "IPsec authenticated")
+        updateCommonHeaders(socket)
+        register()
+    }
+
+
+    private fun setupSecurityServerIpsecIfNeeded(
+        plainRegReply: SipResponse,
+        clientSpiS: IpSecManager.SecurityParameterIndex,
+        clientSpiC: IpSecManager.SecurityParameterIndex,
+        akaResult: SipAkaResult,
+    ): Int {
         var portS = 5060
         // Check if there is a security-server header in the reply
-        if(plainRegReply.headers.containsKey("security-server")) {
+        if (plainRegReply.headers.containsKey("security-server")) {
             val securityServer = plainRegReply.headers["security-server"]!!
             commonHeaders += ("security-verify" to securityServer)
             registerHeaders += ("security-verify" to securityServer)
@@ -1275,122 +1284,300 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             serverSocket.enableIpsec(ipSecManager, serverInTransform, serverOutTransform)
             serverSocketUdp.enableIpsec(ipSecManager, serverInTransform, serverOutTransform)
         }
-        connectSipSocketWithWatchdog(socket, portS, "IPsec authenticated")
-        updateCommonHeaders(socket)
-        register()
 
-        Rlog.d(TAG, "Waiting for authenticated SIP REGISTER response")
-        val authenticatedRegisterReader =
-            if (socket is SipConnectionTcp) socket.gReader()
-            else if (socket is SipConnectionUdp) serverSocketUdp.gReader()
-            else socket.gReader()
+        return portS
+    }
 
-        val regReply = try {
-            authenticatedRegisterReader.parseMessage()
-        } catch (t: Throwable) {
-            Rlog.w(
-                TAG,
-                "Authenticated SIP REGISTER response read failed, aborting SIP",
-                t,
-            )
-            failConnectAndRetry("Authenticated SIP REGISTER response read failed")
-            return
-        }
 
-        if (regReply == null) {
-            Rlog.w(
-                TAG,
-                "Authenticated SIP REGISTER got EOF/no response, aborting SIP",
-            )
-            failConnectAndRetry("Authenticated SIP REGISTER got EOF/no response")
-            return
-        }
-        Rlog.d(TAG, "Received $regReply")
+    private data class SipAkaRegisterChallengeResult(
+        val plainRegReply: SipResponse,
+        val registerChallenge: SipRegisterChallenge,
+        val akaResult: SipAkaResult,
+    )
 
-        if (regReply !is SipResponse || regReply.statusCode != 200) {
-            if (
-                SipRegisterNegotiationPolicy.shouldRetryCanonicalAfterPromoted494(
-                    statusCode = (regReply as? SipResponse)?.statusCode,
-                    decision = registerRealmDecision,
-                    alreadyPreferCanonical = preferCanonicalRegisterRealmAfter494,
-                )
-            ) {
-                Rlog.w(
-                    TAG,
-                    "Promoted REGISTER realm rejected with 494; retrying once with canonical realm: " +
-                        "promotedUri=sip:$registerTargetRealm canonicalUri=sip:$realm " +
-                        "challengeRealm=${registerChallenge.realm}",
-                )
-
-                registerTargetRealm = realm
-                registerSecurityClientOverride = null
-                akaDigest = SipRegistrationDigestFactory.create(
+    private fun resolveAkaRegisterChallenge(
+        plainRegReply: SipResponse,
+        registerChallenge: SipRegisterChallenge,
+    ): SipAkaRegisterChallengeResult? {
+        Rlog.d(TAG, "Requesting AKA challenge")
+        val akaResult = when (val result = sipAkaChallengeForRegistration(subTelephonyManager, registerChallenge.nonceB64)) {
+            is SipAkaChallengeResult.Success -> result.akaResult
+            is SipAkaChallengeResult.SynchronizationFailure -> {
+                Rlog.w(TAG, "AKA AUTS synchronization failure; sending one resynchronization REGISTER")
+                akaDigest = SipRegistrationDigestFactory.createSynchronizationFailure(
                     user = user,
                     realm = registerChallenge.realm,
                     uri = "sip:$realm",
                     nonceB64 = registerChallenge.nonceB64,
                     opaque = registerChallenge.opaque,
-                    akaResult = akaResult,
+                    auts = result.auts,
                     useNonsessAka = requireNonsessAka || registerChallenge.qop == null,
                 )
-                register()
+                register(plainSocket.gWriter())
 
-                Rlog.d(TAG, "Waiting for canonical REGISTER realm retry response")
-                val canonicalRegReply = try {
-                    authenticatedRegisterReader.parseMessage()
-                } catch (t: Throwable) {
-                    Rlog.w(
-                        TAG,
-                        "Canonical REGISTER realm retry response read failed, aborting SIP",
-                        t,
-                    )
-                    failConnectAndRetry("Canonical REGISTER realm retry response read failed")
-                    return
+                val resyncReply = readPlainRegisterReply(plainSocket)
+                Rlog.d(TAG, "Received after AKA AUTS resynchronization $resyncReply")
+                if (resyncReply !is SipResponse || resyncReply.statusCode != 401) {
+                    Rlog.w(TAG, "Didn't get expected 401 after AKA AUTS resynchronization, aborting")
+                    plainSocket.close()
+                    failConnectAndRetry("AKA AUTS resynchronization REGISTER did not return fresh 401")
+                    return null
                 }
 
-                if (canonicalRegReply == null) {
-                    Rlog.w(
-                        TAG,
-                        "Canonical REGISTER realm retry got EOF/no response, aborting SIP",
-                    )
-                    failConnectAndRetry("Canonical REGISTER realm retry got EOF/no response")
-                    return
+                val resyncChallenge = SipRegisterChallengeParser.parse(
+                    response = resyncReply,
+                    fallbackRealm = realm,
+                )
+                Rlog.d(TAG, "Requesting AKA challenge after AUTS resynchronization")
+                val resyncAkaResult = when (val retryResult = sipAkaChallengeForRegistration(subTelephonyManager, resyncChallenge.nonceB64)) {
+                    is SipAkaChallengeResult.Success -> retryResult.akaResult
+                    is SipAkaChallengeResult.SynchronizationFailure -> {
+                        Rlog.w(TAG, "AKA still returns AUTS after one resynchronization REGISTER; aborting")
+                        plainSocket.close()
+                        failConnectAndRetry("AKA still out of sync after AUTS resynchronization")
+                        return null
+                    }
                 }
 
-                Rlog.d(TAG, "Received after canonical REGISTER realm retry $canonicalRegReply")
-                if (canonicalRegReply is SipResponse && canonicalRegReply.statusCode == 200) {
-                    preferCanonicalRegisterRealmAfter494 = true
-                    Rlog.w(
-                        TAG,
-                        "Canonical REGISTER realm retry accepted; keeping challenged realms auth-only " +
-                            "for this IMS session",
-                    )
-
-                    reconnectController.markConnected()
-
-                    installSipCallbacks()
-                    handleResponse(canonicalRegReply)
-
-                    startSipReaderLoops()
-                    return
-                }
-
-                Rlog.w(TAG, "Canonical REGISTER realm retry did not return 200, aborting SIP")
-                failConnectAndRetry("Canonical REGISTER realm retry did not return 200")
-                return
+                return SipAkaRegisterChallengeResult(
+                    plainRegReply = resyncReply,
+                    registerChallenge = resyncChallenge,
+                    akaResult = resyncAkaResult,
+                )
             }
+        }
 
-            Rlog.w(TAG, "Could not connect, aborting SIP")
-            failConnectAndRetry("Authenticated SIP REGISTER did not return 200")
+        return SipAkaRegisterChallengeResult(
+            plainRegReply = plainRegReply,
+            registerChallenge = registerChallenge,
+            akaResult = akaResult,
+        )
+    }
+
+
+    private fun retryCanonicalRegisterAfterPromotedRealm494(
+        registerChallenge: SipRegisterChallenge,
+        akaResult: SipAkaResult,
+    ) {
+        Rlog.w(
+            TAG,
+            "Promoted REGISTER realm rejected with 494; retrying once with canonical realm: " +
+                "promotedUri=sip:$registerTargetRealm canonicalUri=sip:$realm " +
+                "challengeRealm=${registerChallenge.realm}",
+        )
+
+        registerTargetRealm = realm
+        registerSecurityClientOverride = null
+        akaDigest = SipRegistrationDigestFactory.create(
+            user = user,
+            realm = registerChallenge.realm,
+            uri = "sip:$realm",
+            nonceB64 = registerChallenge.nonceB64,
+            opaque = registerChallenge.opaque,
+            akaResult = akaResult,
+            useNonsessAka = requireNonsessAka || registerChallenge.qop == null,
+        )
+        register()
+
+        Rlog.d(TAG, "Waiting for canonical REGISTER realm retry response")
+        val canonicalRegReply = readRegisterReplyOrRetry(
+            readFailureLog = "Canonical REGISTER realm retry response read failed, aborting SIP",
+            readFailureReason = "Canonical REGISTER realm retry response read failed",
+            noResponseLog = "Canonical REGISTER realm retry got EOF/no response, aborting SIP",
+            noResponseReason = "Canonical REGISTER realm retry got EOF/no response",
+            readReply = { readAuthenticatedRegisterReply() },
+        ) ?: return
+
+        Rlog.d(TAG, "Received after canonical REGISTER realm retry $canonicalRegReply")
+        if (canonicalRegReply is SipResponse && canonicalRegReply.statusCode == 200) {
+            preferCanonicalRegisterRealmAfter494 = true
+            Rlog.w(
+                TAG,
+                "Canonical REGISTER realm retry accepted; keeping challenged realms auth-only " +
+                    "for this IMS session",
+            )
+
+            handleAuthenticatedRegisterSuccess(canonicalRegReply)
             return
         }
 
-        reconnectController.markConnected()
+        Rlog.w(TAG, "Canonical REGISTER realm retry did not return 200, aborting SIP")
+        failConnectAndRetry("Canonical REGISTER realm retry did not return 200")
+    }
 
-        installSipCallbacks()
-        handleResponse(regReply)
 
-        startSipReaderLoops()
+    private fun allocateClientIpsecSettingsForRegister(): SipIpsecSettings {
+        val clientSpiC = allocateSecurityParameterIndexWithWatchdog("client SPI-C", localAddr)
+        val clientSpiS = allocateSecurityParameterIndexWithWatchdog("client SPI-S", localAddr, clientSpiC.spi + 1)
+
+        return SipIpsecSettings(
+            clientSpiS = clientSpiS,
+            clientSpiC = clientSpiC,
+        )
+    }
+
+
+    private fun handleAuthenticatedRegisterFailure(
+        regReply: SipMessage,
+        registerRealmDecision: SipRegisterNegotiationPolicy.RegisterRealmDecision,
+        registerChallenge: SipRegisterChallenge,
+        akaResult: SipAkaResult,
+    ) {
+        if (
+            SipRegisterNegotiationPolicy.shouldRetryCanonicalAfterPromoted494(
+                statusCode = (regReply as? SipResponse)?.statusCode,
+                decision = registerRealmDecision,
+                alreadyPreferCanonical = preferCanonicalRegisterRealmAfter494,
+            )
+        ) {
+            retryCanonicalRegisterAfterPromotedRealm494(
+                registerChallenge = registerChallenge,
+                akaResult = akaResult,
+            )
+            return
+        }
+
+        Rlog.w(TAG, "Could not connect, aborting SIP")
+        failConnectAndRetry("Authenticated SIP REGISTER did not return 200")
+    }
+
+
+    private fun readAndHandleAuthenticatedRegisterResponse(
+        registerRealmDecision: SipRegisterNegotiationPolicy.RegisterRealmDecision,
+        registerChallenge: SipRegisterChallenge,
+        akaResult: SipAkaResult,
+    ) {
+        Rlog.d(TAG, "Waiting for authenticated SIP REGISTER response")
+        val regReply = readRegisterReplyOrRetry(
+            readFailureLog = "Authenticated SIP REGISTER response read failed, aborting SIP",
+            readFailureReason = "Authenticated SIP REGISTER response read failed",
+            noResponseLog = "Authenticated SIP REGISTER got EOF/no response, aborting SIP",
+            noResponseReason = "Authenticated SIP REGISTER got EOF/no response",
+            readReply = { readAuthenticatedRegisterReply() },
+        ) ?: return
+        Rlog.d(TAG, "Received $regReply")
+
+        if (regReply !is SipResponse || regReply.statusCode != 200) {
+            handleAuthenticatedRegisterFailure(
+                regReply = regReply,
+                registerRealmDecision = registerRealmDecision,
+                registerChallenge = registerChallenge,
+                akaResult = akaResult,
+            )
+            return
+        }
+
+        handleAuthenticatedRegisterSuccess(regReply)
+    }
+
+
+    private fun prepareAuthenticatedRegisterDigest(
+        registerChallenge: SipRegisterChallenge,
+        registerDigestUriRealm: String,
+        akaResult: SipAkaResult,
+    ) {
+        akaDigest = SipRegistrationDigestFactory.create(
+            user = user,
+            realm = registerChallenge.realm,
+            uri = "sip:$registerDigestUriRealm",
+            nonceB64 = registerChallenge.nonceB64,
+            opaque = registerChallenge.opaque,
+            akaResult = akaResult,
+            useNonsessAka = requireNonsessAka || registerChallenge.qop == null,
+        )
+    }
+
+
+    private data class PlainRegisterChallengeResult(
+        val plainRegReply: SipResponse,
+        val registerChallenge: SipRegisterChallenge,
+    )
+
+    private fun readPlainRegisterChallenge(): PlainRegisterChallengeResult? {
+        val plainRegReply = requirePlainRegisterChallengeResponse(
+            readPlainRegisterReply(plainSocket),
+        ) ?: return null
+
+        val registerChallenge = SipRegisterChallengeParser.parse(
+            response = plainRegReply,
+            fallbackRealm = realm,
+        )
+
+        return PlainRegisterChallengeResult(
+            plainRegReply = plainRegReply,
+            registerChallenge = registerChallenge,
+        )
+    }
+
+
+    private fun authenticateRegisterFromPlainChallenge(
+        clientSpiS: IpSecManager.SecurityParameterIndex,
+        clientSpiC: IpSecManager.SecurityParameterIndex,
+    ) {
+        val plainRegisterChallenge = readPlainRegisterChallenge() ?: return
+        var plainRegReply = plainRegisterChallenge.plainRegReply
+        var registerChallenge = plainRegisterChallenge.registerChallenge
+        val akaChallengeResult = resolveAkaRegisterChallenge(
+            plainRegReply = plainRegReply,
+            registerChallenge = registerChallenge,
+        ) ?: return
+        plainRegReply = akaChallengeResult.plainRegReply
+        registerChallenge = akaChallengeResult.registerChallenge
+        val akaResult = akaChallengeResult.akaResult
+
+        plainSocket.close()
+
+        val registerRealmDecision = applyRegisterRealmDecision(registerChallenge.realm)
+        val registerDigestUriRealm = registerRealmDecision.targetRealm
+        prepareAuthenticatedRegisterDigest(
+            registerChallenge = registerChallenge,
+            registerDigestUriRealm = registerDigestUriRealm,
+            akaResult = akaResult,
+        )
+
+        val portS = setupSecurityServerIpsecIfNeeded(
+            plainRegReply = plainRegReply,
+            clientSpiS = clientSpiS,
+            clientSpiC = clientSpiC,
+            akaResult = akaResult,
+        )
+        connectProtectedSipSocketAndRegister(portS)
+
+        readAndHandleAuthenticatedRegisterResponse(
+            registerRealmDecision = registerRealmDecision,
+            registerChallenge = registerChallenge,
+            akaResult = akaResult,
+        )
+    }
+
+
+    private fun prepareClientIpsecSettingsForRegister(): SipIpsecSettings {
+        val clientIpsecSettings = allocateClientIpsecSettingsForRegister()
+        ipsecSettings = clientIpsecSettings
+        ipsecResourcesClosed = false
+        return clientIpsecSettings
+    }
+
+
+    private fun connectToPreparedImsEndpoint() {
+        Rlog.w(TAG, "Connecting with address ${imsDualSimDebugContext("selectedLocal=$localAddr selectedPcscf=$pcscfAddr")}")
+
+        val clientIpsecSettings = prepareClientIpsecSettingsForRegister()
+
+        setupPlainSipSocketsAndSendInitialRegister()
+
+        authenticateRegisterFromPlainChallenge(
+            clientSpiS = clientIpsecSettings.clientSpiS,
+            clientSpiC = clientIpsecSettings.clientSpiC,
+        )
+    }
+
+    fun connect() {
+        if (!prepareImsEndpointForConnect()) {
+            return
+        }
+
+        connectToPreparedImsEndpoint()
     }
 
     private fun startSipReaderLoops() {
@@ -1511,6 +1698,221 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         setRequestCallback(SipMethod.UPDATE, ::handleUpdate)
     }
 
+
+    private fun handleImsNetworkLost(
+        callback: ConnectivityManager.NetworkCallback,
+        lostNetwork: Network,
+    ) {
+        Rlog.d(TAG, "IMS network lost ${imsDualSimDebugContext("lost=$lostNetwork")}")
+        if (this::network.isInitialized && network == lostNetwork) {
+            try {
+                connectivityManager.unregisterNetworkCallback(callback)
+                if (imsNetworkCallback === callback) {
+                    imsNetworkCallback = null
+                }
+                Rlog.w(TAG, "Unregistered stale IMS NetworkCallback after loss to avoid immediate GERAN IMS APN retry")
+            } catch (t: Throwable) {
+                Rlog.d(TAG, "Unregistering stale IMS NetworkCallback failed", t)
+            }
+            Rlog.w(TAG, "Current IMS network was lost; dropping SIP state")
+            Rlog.w(TAG, "Invalidating IMS reconnect generation: current IMS network lost")
+            reconnectController.invalidatePendingReconnects("IMS network state changed")
+            dropImsConnection("IMS network lost")
+            abandonnedBecauseOfNoPcscf = true
+            imsFailureCallback?.invoke()
+            scheduleImsNetworkRequestRestart("IMS network lost $lostNetwork")
+        }
+    }
+
+
+    private fun handleImsNetworkCapabilitiesChanged(
+        changedNetwork: Network,
+        networkCapabilities: NetworkCapabilities,
+    ) {
+        Rlog.d(TAG, "IMS network capabilities changed ${imsDualSimDebugContext("capabilities=$networkCapabilities")}")
+        val isCurrentImsNetwork =
+            this::network.isInitialized &&
+                changedNetwork == network
+
+        if (isCurrentImsNetwork) {
+            imsTransportGuard.onCapabilitiesChanged(changedNetwork, networkCapabilities)
+        }
+
+        if (
+            isCurrentImsNetwork &&
+                hasPendingIncomingCallForAcceptGuard()
+        ) {
+            noteImsAccessChangeDuringPendingIncomingCall(
+                "IMS network capabilities changed caps=$networkCapabilities",
+            )
+        }
+    }
+
+
+    private fun handleImsNetworkAvailable(availableNetwork: Network) {
+        Rlog.d(TAG, "Got IMS network ${imsDualSimDebugContext("network=$availableNetwork")}")
+        if (!this::network.isInitialized) {
+            network = availableNetwork
+            thread {
+                Thread.sleep(4000)
+                try {
+                    connect()
+                } catch (e: Throwable) {
+                    Rlog.e(TAG, "connect() failed from IMS network callback", e)
+                    failConnectAndRetry("connect() failed from IMS network callback")
+                }
+            }
+        } else if (abandonnedBecauseOfNoPcscf || network != availableNetwork) {
+            reconnectIms(
+                "new IMS network available old=${network} new=$availableNetwork abandoned=$abandonnedBecauseOfNoPcscf",
+                availableNetwork,
+                delayMs = 4000L,
+            )
+        } else {
+            Rlog.d(TAG, "... already using this IMS network")
+        }
+    }
+
+
+    private fun handleImsNetworkLinkPropertiesChanged(
+        changedNetwork: Network,
+        linkProperties: LinkProperties,
+    ) {
+        Rlog.d(TAG, "IMS network link properties changed ${imsDualSimDebugContext("linkProperties=$linkProperties")}")
+        val pcscfs = getPcscfServers(linkProperties)
+        val newLocalAddr = getImsLocalAddress(linkProperties)
+        val newPcscfAddr = pcscfs.firstOrNull()
+        Rlog.d(TAG, "Got pcscfs $pcscfs local=$newLocalAddr")
+        if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
+            // Switch to this network if it has P-CSCF (could be a different bearer).
+            reconnectIms("P-CSCF appeared after previous no-P-CSCF state", changedNetwork)
+            return
+        }
+
+        if (!this::network.isInitialized) return
+
+        val oldLocalAddr = if (this::localAddr.isInitialized) localAddr else null
+        val oldPcscfAddr = if (this::pcscfAddr.isInitialized) pcscfAddr else null
+        val oldRegistrationTech = imsRegistrationTech
+        val newRegistrationTech = detectRegistrationTech(linkProperties)
+
+        if (pendingCellularReconnectAfterWfcDisable) {
+            val iface = linkProperties.interfaceName ?: ""
+            if (newRegistrationTech == REGISTRATION_TECH_IWLAN || iface.startsWith("ipsec")) {
+                Rlog.w(
+                    TAG,
+                    "Pending WFC-disable cellular reconnect; ignoring still-IWLAN IMS link " +
+                        "interface=$iface tech=${registrationTechName(newRegistrationTech)}",
+                )
+                return
+            }
+            if (newLocalAddr == null || newPcscfAddr == null) {
+                Rlog.w(
+                    TAG,
+                    "Pending WFC-disable cellular reconnect; waiting for usable cellular IMS link " +
+                        "interface=$iface local=$newLocalAddr pcscf=$newPcscfAddr",
+                )
+                return
+            }
+
+            pendingCellularReconnectAfterWfcDisable = false
+            reconnectIms(
+                "cellular IMS link after WFC disabled interface=$iface " +
+                    "tech=${registrationTechName(newRegistrationTech)} local=$newLocalAddr pcscf=$newPcscfAddr",
+                changedNetwork,
+                delayMs = 1_000L,
+            )
+            return
+        }
+
+        val networkChanged = network != changedNetwork
+        val localChanged = oldLocalAddr != null && newLocalAddr != null && oldLocalAddr != newLocalAddr
+        val pcscfChanged = oldPcscfAddr != null && newPcscfAddr != null && oldPcscfAddr != newPcscfAddr
+        val techChanged = imsReady && oldRegistrationTech != newRegistrationTech
+        val techOnlyChanged = techChanged && !networkChanged && !localChanged && !pcscfChanged
+
+        if (techOnlyChanged && hasActiveOrPendingCallForImsReconnectDeferral()) {
+            val deferredReason = "tech-only IMS link changed during call: " +
+                "oldTech=${registrationTechName(oldRegistrationTech)} " +
+                "newTech=${registrationTechName(newRegistrationTech)} " +
+                "interface=${linkProperties.interfaceName}"
+            pendingImsReconnectAfterActiveCallReason = deferredReason
+            noteImsAccessChangeDuringPendingIncomingCall(deferredReason)
+            Rlog.w(
+                TAG,
+                "Deferring tech-only IMS reconnect while SIP call is active or pending: " +
+                    deferredReason + " " + activeOrPendingCallSummaryForReconnectDeferral(),
+            )
+            return
+        }
+
+        if (networkChanged || localChanged || pcscfChanged || techChanged) {
+            reconnectIms(
+                "IMS link changed networkChanged=$networkChanged " +
+                    "localChanged=$localChanged pcscfChanged=$pcscfChanged " +
+                    "techChanged=$techChanged oldLocal=$oldLocalAddr " +
+                    "newLocal=$newLocalAddr oldPcscf=$oldPcscfAddr " +
+                    "newPcscf=$newPcscfAddr oldTech=${registrationTechName(oldRegistrationTech)} " +
+                    "newTech=${registrationTechName(newRegistrationTech)} " +
+                    "interface=${linkProperties.interfaceName}",
+                changedNetwork,
+                delayMs = if (
+                    techChanged &&
+                        oldRegistrationTech == REGISTRATION_TECH_IWLAN &&
+                        newRegistrationTech == REGISTRATION_TECH_LTE
+                ) 6_000L else 1_000L,
+            )
+        }
+    }
+
+
+    private fun createImsNetworkCallback(): ConnectivityManager.NetworkCallback {
+        return object : ConnectivityManager.NetworkCallback() {
+            override fun onUnavailable() {
+                Rlog.d(TAG, "IMS network unavailable ${imsDualSimDebugContext()}")
+            }
+
+            override fun onLost(lostNetwork: Network) {
+                handleImsNetworkLost(
+                    callback = this,
+                    lostNetwork = lostNetwork,
+                )
+            }
+
+            override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+                Rlog.d(TAG, "IMS network blocked status changed ${imsDualSimDebugContext("blocked=$blocked")}")
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                handleImsNetworkCapabilitiesChanged(
+                    changedNetwork = network,
+                    networkCapabilities = networkCapabilities,
+                )
+            }
+
+            override fun onLosing(network: Network, maxMsToLive: Int) {
+                Rlog.d(TAG, "IMS network losing")
+            }
+
+            override fun onLinkPropertiesChanged(
+                _network: Network,
+                linkProperties: LinkProperties,
+            ) {
+                handleImsNetworkLinkPropertiesChanged(
+                    changedNetwork = _network,
+                    linkProperties = linkProperties,
+                )
+            }
+
+            override fun onAvailable(_network: Network) {
+                handleImsNetworkAvailable(_network)
+            }
+        }
+    }
+
     fun getVolteNetwork() {
         // TODO add something similar for VoWifi ipsec tunnel?
         Rlog.d(TAG, "Requesting IMS network ${imsDualSimDebugContext()}")
@@ -1525,174 +1927,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         unregisterImsNetworkCallback("new IMS network request")
 
-        val callback = object : ConnectivityManager.NetworkCallback() {
-                override fun onUnavailable() {
-                    Rlog.d(TAG, "IMS network unavailable ${imsDualSimDebugContext()}")
-                }
-
-                override fun onLost(lostNetwork: Network) {
-                    Rlog.d(TAG, "IMS network lost ${imsDualSimDebugContext("lost=$lostNetwork")}")
-                    if (this@SipHandler::network.isInitialized && network == lostNetwork) {
-                        try {
-                    connectivityManager.unregisterNetworkCallback(this)
-                        if (imsNetworkCallback === this) {
-                            imsNetworkCallback = null
-                        }
-                    Rlog.w(TAG, "Unregistered stale IMS NetworkCallback after loss to avoid immediate GERAN IMS APN retry")
-                } catch (t: Throwable) {
-                    Rlog.d(TAG, "Unregistering stale IMS NetworkCallback failed", t)
-                }
-                Rlog.w(TAG, "Current IMS network was lost; dropping SIP state")
-                        Rlog.w(TAG, "Invalidating IMS reconnect generation: current IMS network lost")
-                        reconnectController.invalidatePendingReconnects("IMS network state changed")
-                        dropImsConnection("IMS network lost")
-                        abandonnedBecauseOfNoPcscf = true
-                        imsFailureCallback?.invoke()
-                scheduleImsNetworkRequestRestart("IMS network lost $lostNetwork")
-                    }
-                }
-
-                override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
-                    Rlog.d(TAG, "IMS network blocked status changed ${imsDualSimDebugContext("blocked=$blocked")}")
-                }
-                override fun onCapabilitiesChanged(
-                    network: Network,
-                    networkCapabilities: NetworkCapabilities
-                ) {
-                    Rlog.d(TAG, "IMS network capabilities changed ${imsDualSimDebugContext("capabilities=$networkCapabilities")}")
-                    val isCurrentImsNetwork =
-                        this@SipHandler::network.isInitialized &&
-                            network == this@SipHandler.network
-
-                    if (isCurrentImsNetwork) {
-                        imsTransportGuard.onCapabilitiesChanged(network, networkCapabilities)
-                    }
-
-                    if (
-                        isCurrentImsNetwork &&
-                            hasPendingIncomingCallForAcceptGuard()
-                    ) {
-                        noteImsAccessChangeDuringPendingIncomingCall(
-                            "IMS network capabilities changed caps=$networkCapabilities",
-                        )
-                    }
-                }
-
-                override fun onLosing(network: Network, maxMsToLive: Int) {
-                    Rlog.d(TAG, "IMS network losing")
-                }
-
-                override fun onLinkPropertiesChanged(
-                    _network: Network,
-                    linkProperties: LinkProperties
-                ) {
-                    Rlog.d(TAG, "IMS network link properties changed ${imsDualSimDebugContext("linkProperties=$linkProperties")}")
-                    val pcscfs = getPcscfServers(linkProperties)
-                    val newLocalAddr = getImsLocalAddress(linkProperties)
-                    val newPcscfAddr = pcscfs.firstOrNull()
-                    Rlog.d(TAG, "Got pcscfs $pcscfs local=$newLocalAddr")
-if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
-                        // Switch to this network if it has P-CSCF (could be a different bearer).
-                        reconnectIms("P-CSCF appeared after previous no-P-CSCF state", _network)
-                        return
-                    }
-
-                    if (!this@SipHandler::network.isInitialized) return
-
-                    val oldLocalAddr = if (this@SipHandler::localAddr.isInitialized) localAddr else null
-                    val oldPcscfAddr = if (this@SipHandler::pcscfAddr.isInitialized) pcscfAddr else null
-                    val oldRegistrationTech = imsRegistrationTech
-                    val newRegistrationTech = detectRegistrationTech(linkProperties)
-
-                    if (pendingCellularReconnectAfterWfcDisable) {
-                        val iface = linkProperties.interfaceName ?: ""
-                        if (newRegistrationTech == REGISTRATION_TECH_IWLAN || iface.startsWith("ipsec")) {
-                            Rlog.w(
-                                TAG,
-                                "Pending WFC-disable cellular reconnect; ignoring still-IWLAN IMS link " +
-                                    "interface=$iface tech=${registrationTechName(newRegistrationTech)}",
-                            )
-                            return
-                        }
-                        if (newLocalAddr == null || newPcscfAddr == null) {
-                            Rlog.w(
-                                TAG,
-                                "Pending WFC-disable cellular reconnect; waiting for usable cellular IMS link " +
-                                    "interface=$iface local=$newLocalAddr pcscf=$newPcscfAddr",
-                            )
-                            return
-                        }
-
-                        pendingCellularReconnectAfterWfcDisable = false
-                        reconnectIms(
-                            "cellular IMS link after WFC disabled interface=$iface " +
-                                "tech=${registrationTechName(newRegistrationTech)} local=$newLocalAddr pcscf=$newPcscfAddr",
-                            _network,
-                            delayMs = 1_000L,
-                        )
-                        return
-                    }
-
-                    val networkChanged = network != _network
-                    val localChanged = oldLocalAddr != null && newLocalAddr != null && oldLocalAddr != newLocalAddr
-                    val pcscfChanged = oldPcscfAddr != null && newPcscfAddr != null && oldPcscfAddr != newPcscfAddr
-                    val techChanged = imsReady && oldRegistrationTech != newRegistrationTech
-                    val techOnlyChanged = techChanged && !networkChanged && !localChanged && !pcscfChanged
-
-                    if (techOnlyChanged && hasActiveOrPendingCallForImsReconnectDeferral()) {
-                        val deferredReason = "tech-only IMS link changed during call: " +
-                            "oldTech=${registrationTechName(oldRegistrationTech)} " +
-                            "newTech=${registrationTechName(newRegistrationTech)} " +
-                            "interface=${linkProperties.interfaceName}"
-                        pendingImsReconnectAfterActiveCallReason = deferredReason
-                        noteImsAccessChangeDuringPendingIncomingCall(deferredReason)
-                        Rlog.w(
-                            TAG,
-                            "Deferring tech-only IMS reconnect while SIP call is active or pending: " +
-                                deferredReason + " " + activeOrPendingCallSummaryForReconnectDeferral(),
-                        )
-                        return
-                    }
-
-                    if (networkChanged || localChanged || pcscfChanged || techChanged) {
-                        reconnectIms(
-                            "IMS link changed networkChanged=$networkChanged " +
-                                "localChanged=$localChanged pcscfChanged=$pcscfChanged " +
-                                "techChanged=$techChanged oldLocal=$oldLocalAddr " +
-                                "newLocal=$newLocalAddr oldPcscf=$oldPcscfAddr " +
-                                "newPcscf=$newPcscfAddr oldTech=${registrationTechName(oldRegistrationTech)} " +
-                                "newTech=${registrationTechName(newRegistrationTech)} " +
-                                "interface=${linkProperties.interfaceName}",
-                            _network,
-                            delayMs = if (
-                                techChanged &&
-                                    oldRegistrationTech == REGISTRATION_TECH_IWLAN &&
-                                    newRegistrationTech == REGISTRATION_TECH_LTE
-                            ) 6_000L else 1_000L,
-                        )
-                    }
-                }
-
-                override fun onAvailable(_network: Network) {
-                    Rlog.d(TAG, "Got IMS network ${imsDualSimDebugContext("network=$_network")}")
-                    if (!this@SipHandler::network.isInitialized) {
-                        network = _network
-                        thread {
-                            Thread.sleep(4000)
-                            try {
-                                connect()
-                            } catch (e: Throwable) {
-                                Rlog.e(TAG, "connect() failed from IMS network callback", e)
-                        failConnectAndRetry("connect() failed from IMS network callback")
-                            }
-                        }
-                    } else if (abandonnedBecauseOfNoPcscf || network != _network) {
-                        reconnectIms("new IMS network available old=${network} new=$_network abandoned=$abandonnedBecauseOfNoPcscf", _network, delayMs = 4000L)
-                    } else {
-                        Rlog.d(TAG, "... already using this IMS network")
-                    }
-                }
-            }
+        val callback = createImsNetworkCallback()
 
         imsNetworkCallback = callback
         connectivityManager.requestNetwork(imsNetworkRequest, callback)
@@ -1859,49 +2094,53 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         return 200
     }
 
-    fun handleUpdate(request: SipRequest): Int {
-        val requestCallId = request.callIdOrEmpty()
-        val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
-        val call = currentCall
-        val currentCallId = call?.callIdOrNull()
 
-        if (call == null || currentCallId != requestCallId) {
-            Rlog.w(TAG, "Rejecting UPDATE for non-current dialog: callId=$requestCallId cseq=$requestCseq current=$currentCallId")
-            return 481
-        }
-
+    private fun updateResponseWriterFor(request: SipRequest): java.io.OutputStream {
         val updateCallId = request.headers.callIdOrNull()
-        val updateResponseWriter = updateCallId?.let { dispatcher.writerForCallId(it) } ?: socket.gWriter()
+        return updateCallId?.let { dispatcher.writerForCallId(it) } ?: socket.gWriter()
+    }
 
-        fun writeUpdateReply(reply: SipResponse) {
-            Rlog.d(TAG, "Replying to UPDATE with $reply")
-            synchronized(updateResponseWriter) {
-                updateResponseWriter.write(reply.toByteArray())
-            }
+    private fun writeUpdateReply(
+        updateResponseWriter: java.io.OutputStream,
+        reply: SipResponse,
+    ) {
+        Rlog.d(TAG, "Replying to UPDATE with $reply")
+        synchronized(updateResponseWriter) {
+            updateResponseWriter.write(reply.toByteArray())
         }
+    }
 
-        val isSdp = request.headers["content-type"]
-            ?.getOrNull(0)
-            ?.startsWith("application/sdp", ignoreCase = true) == true &&
-            request.body.isNotEmpty()
+    private fun okUpdateWithoutSdpResponse(
+        request: SipRequest,
+        requestCallId: String,
+    ): SipResponse {
+        return SipResponse(
+            statusCode = 200,
+            statusString = "OK",
+            headersParam = request.headers.filter { (k, _) ->
+                k in listOf("cseq", "via", "from", "to", "call-id")
+            } + """
+                Supported: 100rel, replaces, timer
+                Call-ID: $requestCallId
+                Content-Length: 0
+            """.toSipHeadersMap(),
+            autofill = false,
+        )
+    }
 
-        if (!isSdp) {
-            val reply = SipResponse(
-                statusCode = 200,
-                statusString = "OK",
-                headersParam = request.headers.filter { (k, _) ->
-                    k in listOf("cseq", "via", "from", "to", "call-id")
-                } + """
-                    Supported: 100rel, replaces, timer
-                    Call-ID: $requestCallId
-                    Content-Length: 0
-                """.toSipHeadersMap(),
-                autofill = false,
-            )
-            writeUpdateReply(reply)
-            return 0
-        }
 
+    private data class UpdateSdpOffer(
+        val rtpRemoteAddr: InetAddress,
+        val rtpRemotePort: Int,
+        val offeredPayloads: Set<Int>,
+        val attributes: List<String>,
+    )
+
+    private fun parseUpdateSdpOffer(
+        request: SipRequest,
+        requestCallId: String,
+        requestCseq: String,
+    ): UpdateSdpOffer? {
         val sdp = request.body
             .toString(Charsets.UTF_8)
             .split("[\\r\\n]+".toRegex())
@@ -1918,7 +2157,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         val sdpMedia = sdpElement("m")
         if (sdpConnectionData == null || sdpMedia == null) {
             Rlog.w(TAG, "Rejecting UPDATE without usable c=/m= SDP: callId=$requestCallId cseq=$requestCseq")
-            return 488
+            return null
         }
 
         val rtpRemote = sdpConnectionData.split(" ").getOrNull(2)
@@ -1933,67 +2172,67 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 "Rejecting UPDATE with incomplete media address/payloads: " +
                     "callId=$requestCallId cseq=$requestCseq c=$sdpConnectionData m=$sdpMedia",
             )
-            return 488
+            return null
         }
 
-        val attributes = sdp.filter { it.startsWith("a=") }.map { it.substring(2) }
         SipAudioCodecSdpLogger.logRemoteAudioCodecCandidates(
             tag = TAG,
             context = "remote SDP ${request.method} callId=${request.callIdOrEmpty()}",
             sdp = sdp,
         )
 
-        fun trackRequirements(track: Int): String? {
-            return attributes.firstOrNull { it.startsWith("fmtp:$track") }
-        }
+        return UpdateSdpOffer(
+            rtpRemoteAddr = rtpRemoteAddr,
+            rtpRemotePort = rtpRemotePort,
+            offeredPayloads = offeredPayloads,
+            attributes = sdp.filter { it.startsWith("a=") }.map { it.substring(2) },
+        )
+    }
 
-        fun lookTrackMatching(
-            codec: String,
-            additional: String = "",
-            notAdditional: String = "",
-        ): Pair<Int, String>? {
-            val maps = attributes.filter { it.startsWith("rtpmap:") && it.contains(codec) }
-            val matches = maps.mapNotNull { m ->
-                val track = m.split("[: ]+".toRegex()).getOrNull(1)?.toIntOrNull()
-                if (track != null && offeredPayloads.contains(track)) Pair(track, m) else null
+
+    private fun updateTrackRequirements(
+        attributes: List<String>,
+        track: Int,
+    ): String? {
+        return attributes.firstOrNull { it.startsWith("fmtp:$track") }
+    }
+
+    private fun lookUpdateTrackMatching(
+        attributes: List<String>,
+        offeredPayloads: Set<Int>,
+        codec: String,
+        additional: String = "",
+        notAdditional: String = "",
+    ): Pair<Int, String>? {
+        val maps = attributes.filter { it.startsWith("rtpmap:") && it.contains(codec) }
+        val matches = maps.mapNotNull { m ->
+            val track = m.split("[: ]+".toRegex()).getOrNull(1)?.toIntOrNull()
+            if (track != null && offeredPayloads.contains(track)) Pair(track, m) else null
+        }
+        val sorted = matches.sortedBy { m ->
+            val fmtp = updateTrackRequirements(attributes, m.first).orEmpty()
+            when {
+                // Our RTP encoder currently sends AMR-NB bandwidth-efficient frames.
+                // SDP without octet-align defaults to octet-align=0, so prefer that
+                // over octet-align=1 when carriers offer both forms in UPDATE.
+                codec.startsWith("AMR") && fmtp.contains("octet-align=1", ignoreCase = true) -> 100
+                codec.startsWith("AMR") && fmtp.isEmpty() -> 0
+                notAdditional.isNotEmpty() && fmtp.contains(notAdditional, ignoreCase = true) -> 90
+                additional.isNotEmpty() && fmtp.contains(additional, ignoreCase = true) -> 0
+                else -> 10
             }
-            val sorted = matches.sortedBy { m ->
-                val fmtp = trackRequirements(m.first).orEmpty()
-                when {
-                    // Our RTP encoder currently sends AMR-NB bandwidth-efficient frames.
-                    // SDP without octet-align defaults to octet-align=0, so prefer that
-                    // over octet-align=1 when carriers offer both forms in UPDATE.
-                    codec.startsWith("AMR") && fmtp.contains("octet-align=1", ignoreCase = true) -> 100
-                    codec.startsWith("AMR") && fmtp.isEmpty() -> 0
-                    notAdditional.isNotEmpty() && fmtp.contains(notAdditional, ignoreCase = true) -> 90
-                    additional.isNotEmpty() && fmtp.contains(additional, ignoreCase = true) -> 0
-                    else -> 10
-                }
-            }
-            Rlog.d(TAG, "UPDATE matching $codec offered=$offeredPayloads got=$sorted")
-            return sorted.firstOrNull()
         }
+        Rlog.d(TAG, "UPDATE matching $codec offered=$offeredPayloads got=$sorted")
+        return sorted.firstOrNull()
+    }
 
-        // Keep the selected speech payload first in SDP answers. Sorting payload IDs can
-        // put telephone-event before AMR-WB, e.g. m=audio ... 96 104, which some
-        // IMS cores reject as an offer/answer error during precondition UPDATE.
-        val selectedAudioCodec = call.audioCodec
-        val amr = lookTrackMatching(SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec), notAdditional = "octet-align=1")
-        if (amr == null) {
-            Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
-            return 488
-        }
-        val (amrTrack, amrTrackDesc) = amr
-        val amrFmtpAnswer = trackRequirements(amrTrack)
-            ?: SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(amrTrack, selectedAudioCodec)
 
-        val dtmf = lookTrackMatching(SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec))
-        if (dtmf == null) {
-            Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
-            return 488
-        }
-        val (dtmfTrack, dtmfTrackDesc) = dtmf
-
+    private fun connectUpdateRtpSocketIfNeeded(
+        call: Call,
+        rtpRemoteAddr: InetAddress,
+        rtpRemotePort: Int,
+        requestCallId: String,
+    ) {
         try {
             if (!call.rtpSocket.isConnected ||
                 call.rtpSocket.inetAddress != rtpRemoteAddr ||
@@ -2008,7 +2247,20 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         } catch (t: Throwable) {
             Rlog.w(TAG, "Failed to connect RTP socket from UPDATE to ${rtpRemoteAddr}:${rtpRemotePort} callId=$requestCallId", t)
         }
+    }
 
+
+    private fun buildUpdateAnswerSdp(
+        request: SipRequest,
+        call: Call,
+        attributes: List<String>,
+        amrTrack: Int,
+        amrTrackDesc: String,
+        amrFmtpAnswer: String,
+        dtmfTrack: Int,
+        dtmfTrackDesc: String,
+    ): ByteArray {
+        val selectedAudioCodec = call.audioCodec
         val allTracks = listOf(amrTrack, dtmfTrack)
         val ipType = if (socket.gLocalAddr() is Inet6Address) "IP6" else "IP4"
         val owner = request.destination.substringAfter("sip:").substringBefore("@").ifBlank { "-" }
@@ -2042,9 +2294,44 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             "a=conf:qos remote sendrecv",
             "a=sendrecv",
         )
-        val answerSdp = answerSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
 
-        currentCall = call.copy(
+        return answerSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
+    }
+
+
+    private fun okUpdateWithSdpResponse(
+        request: SipRequest,
+        callId: String,
+        answerSdp: ByteArray,
+    ): SipResponse {
+        return SipResponse(
+            statusCode = 200,
+            statusString = "OK",
+            headersParam = request.headers.filter { (k, _) ->
+                k in listOf("cseq", "via", "from", "to", "call-id")
+            } + """
+                Content-Type: application/sdp
+                Supported: 100rel, replaces, timer
+                Require: precondition
+                Call-ID: $callId
+            """.toSipHeadersMap(),
+            body = answerSdp,
+        )
+    }
+
+
+    private fun updateCurrentCallFromUpdateSdp(
+        call: Call,
+        request: SipRequest,
+        answerSdp: ByteArray,
+        amrTrack: Int,
+        amrTrackDesc: String,
+        dtmfTrack: Int,
+        dtmfTrackDesc: String,
+        rtpRemoteAddr: InetAddress,
+        rtpRemotePort: Int,
+    ): Call {
+        val updatedCall = call.copy(
             amrTrack = amrTrack,
             amrTrackDesc = amrTrackDesc,
             dtmfTrack = dtmfTrack,
@@ -2056,34 +2343,138 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 ?.let { extractDestinationFromContact(it) }
                 ?: call.remoteContact,
         )
+        currentCall = updatedCall
+        return updatedCall
+    }
 
-        val reply = SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = request.headers.filter { (k, _) ->
-                k in listOf("cseq", "via", "from", "to", "call-id")
-            } + """
-                Content-Type: application/sdp
-                Supported: 100rel, replaces, timer
-                Require: precondition
-                Call-ID: ${currentCall!!.callIdOrEmpty()}
-            """.toSipHeadersMap(),
-            body = answerSdp,
-        )
-        writeUpdateReply(reply)
 
-        if (!call.outgoing) {
-            val myHeaders2 = call.callHeaders - "rseq" - "content-type" - "require"
-            val msg2 = SipResponse(
-                statusCode = 180,
-                statusString = "Ringing",
-                headersParam = myHeaders2,
-            )
-            Rlog.d(TAG, "Sending $msg2")
-            synchronized(updateResponseWriter) {
-                updateResponseWriter.write(msg2.toByteArray())
-            }
+    private fun sendIncomingUpdateRingingIfNeeded(
+        call: Call,
+        updateResponseWriter: java.io.OutputStream,
+    ) {
+        if (call.outgoing) {
+            return
         }
+
+        val myHeaders2 = call.callHeaders - "rseq" - "content-type" - "require"
+        val msg2 = SipResponse(
+            statusCode = 180,
+            statusString = "Ringing",
+            headersParam = myHeaders2,
+        )
+        Rlog.d(TAG, "Sending $msg2")
+        synchronized(updateResponseWriter) {
+            updateResponseWriter.write(msg2.toByteArray())
+        }
+    }
+
+    fun handleUpdate(request: SipRequest): Int {
+        val requestCallId = request.callIdOrEmpty()
+        val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
+        val call = currentCall
+        val currentCallId = call?.callIdOrNull()
+
+        if (call == null || currentCallId != requestCallId) {
+            Rlog.w(TAG, "Rejecting UPDATE for non-current dialog: callId=$requestCallId cseq=$requestCseq current=$currentCallId")
+            return 481
+        }
+
+        val updateResponseWriter = updateResponseWriterFor(request)
+
+        val isSdp = request.headers["content-type"]
+            ?.getOrNull(0)
+            ?.startsWith("application/sdp", ignoreCase = true) == true &&
+            request.body.isNotEmpty()
+
+        if (!isSdp) {
+            val reply = okUpdateWithoutSdpResponse(
+                request = request,
+                requestCallId = requestCallId,
+            )
+            writeUpdateReply(updateResponseWriter, reply)
+            return 0
+        }
+
+        val updateSdpOffer = parseUpdateSdpOffer(
+            request = request,
+            requestCallId = requestCallId,
+            requestCseq = requestCseq,
+        ) ?: return 488
+        val rtpRemoteAddr = updateSdpOffer.rtpRemoteAddr
+        val rtpRemotePort = updateSdpOffer.rtpRemotePort
+        val offeredPayloads = updateSdpOffer.offeredPayloads
+        val attributes = updateSdpOffer.attributes
+
+        // Keep the selected speech payload first in SDP answers. Sorting payload IDs can
+        // put telephone-event before AMR-WB, e.g. m=audio ... 96 104, which some
+        // IMS cores reject as an offer/answer error during precondition UPDATE.
+        val selectedAudioCodec = call.audioCodec
+        val amr = lookUpdateTrackMatching(
+            attributes = attributes,
+            offeredPayloads = offeredPayloads,
+            codec = SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec),
+            notAdditional = "octet-align=1",
+        )
+        if (amr == null) {
+            Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
+            return 488
+        }
+        val (amrTrack, amrTrackDesc) = amr
+        val amrFmtpAnswer = updateTrackRequirements(attributes, amrTrack)
+            ?: SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(amrTrack, selectedAudioCodec)
+
+        val dtmf = lookUpdateTrackMatching(
+            attributes = attributes,
+            offeredPayloads = offeredPayloads,
+            codec = SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec),
+        )
+        if (dtmf == null) {
+            Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
+            return 488
+        }
+        val (dtmfTrack, dtmfTrackDesc) = dtmf
+
+        connectUpdateRtpSocketIfNeeded(
+            call = call,
+            rtpRemoteAddr = rtpRemoteAddr,
+            rtpRemotePort = rtpRemotePort,
+            requestCallId = requestCallId,
+        )
+
+        val answerSdp = buildUpdateAnswerSdp(
+            request = request,
+            call = call,
+            attributes = attributes,
+            amrTrack = amrTrack,
+            amrTrackDesc = amrTrackDesc,
+            amrFmtpAnswer = amrFmtpAnswer,
+            dtmfTrack = dtmfTrack,
+            dtmfTrackDesc = dtmfTrackDesc,
+        )
+
+        val updatedCall = updateCurrentCallFromUpdateSdp(
+            call = call,
+            request = request,
+            answerSdp = answerSdp,
+            amrTrack = amrTrack,
+            amrTrackDesc = amrTrackDesc,
+            dtmfTrack = dtmfTrack,
+            dtmfTrackDesc = dtmfTrackDesc,
+            rtpRemoteAddr = rtpRemoteAddr,
+            rtpRemotePort = rtpRemotePort,
+        )
+
+        val reply = okUpdateWithSdpResponse(
+            request = request,
+            callId = updatedCall.callIdOrEmpty(),
+            answerSdp = answerSdp,
+        )
+        writeUpdateReply(updateResponseWriter, reply)
+
+        sendIncomingUpdateRingingIfNeeded(
+            call = call,
+            updateResponseWriter = updateResponseWriter,
+        )
 
         return 0
     }
