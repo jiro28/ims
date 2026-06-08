@@ -586,6 +586,29 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         return ImsNetworkState.detectRegistrationTech(connectivityManager, currentNetwork, lp)
     }
 
+    private fun refreshRegistrationTechFromCurrentLink(reason: String) {
+        val currentNetwork = if (this::network.isInitialized) network else null
+        val lp = currentNetwork?.let { connectivityManager.getLinkProperties(it) } ?: return
+        val newTech = detectRegistrationTech(lp)
+
+        if (newTech == imsRegistrationTech) {
+            Rlog.d(
+                TAG,
+                "IMS registration tech unchanged before $reason: " +
+                    "${registrationTechName(newTech)} interface=${lp.interfaceName}",
+            )
+            return
+        }
+
+        Rlog.d(
+            TAG,
+            "IMS registration tech changed before $reason: " +
+                "old=${registrationTechName(imsRegistrationTech)} " +
+                "new=${registrationTechName(newTech)} interface=${lp.interfaceName}",
+        )
+        imsRegistrationTech = newTech
+    }
+
     private fun resetRegistrationStateForConnect() {
         registerCounter = 1
         akaDigest = initialRegisterAuthorization()
@@ -1494,6 +1517,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         // REGISTER 200 OK is the actual IMS registration success.  Do not
         // block framework registration state on the optional reg-event
         // SUBSCRIBE path; some carriers answer it very late with 504.
+        refreshRegistrationTechFromCurrentLink("REGISTER 200 OK")
         markImsReady("REGISTER 200 OK")
 
         // always keep callback
