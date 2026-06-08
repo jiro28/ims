@@ -51,6 +51,7 @@ class SipHandler(val ctxt: Context) {
 
     @SuppressLint("MissingPermission")
     private val activeSubscription = subscriptionManager.activeSubscriptionInfoList!![0]
+    @Suppress("DEPRECATION")
     private val imei = telephonyManager.getDeviceId(activeSubscription.simSlotIndex)
     private val subId = activeSubscription.subscriptionId
     private val mcc = telephonyManager.simOperator.substring(0 until 3)
@@ -878,7 +879,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             if(cell is CellInfoLte) {
                 val cellIdentity = cell.cellIdentity
                 val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "LTE cell: ${cellIdentity.ci}, ${cellIdentity.pci}, ${cellIdentity.tac}, ${cellIdentity.mcc}, ${cellIdentity.mnc}, ${cellSignalStrength.dbm}")
+                Rlog.d(TAG, "LTE cell: ${cellIdentity.ci}, ${cellIdentity.pci}, ${cellIdentity.tac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
             } else if(cell is CellInfoNr) {
                 val cellIdentity = cell.cellIdentity
                 val cellSignalStrength = cell.cellSignalStrength
@@ -886,11 +887,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             } else if(cell is CellInfoWcdma) {
                 val cellIdentity = cell.cellIdentity
                 val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "WCDMA cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mcc}, ${cellIdentity.mnc}, ${cellSignalStrength.dbm}")
+                Rlog.d(TAG, "WCDMA cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
             } else if(cell is CellInfoGsm) {
                 val cellIdentity = cell.cellIdentity
                 val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "GSM cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mcc}, ${cellIdentity.mnc}, ${cellSignalStrength.dbm}")
+                Rlog.d(TAG, "GSM cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
             }
         }
 
@@ -1382,7 +1383,7 @@ a=sendrecv
                 )
                 val amrNothing = listOf(0x77, 0xc0) // CMR = 12.2kbps, F=0, FT=15=No TX/No RX, Q=1
 
-                val buf = (rtpHeader + amrNothing).map { it.toUByte() }.toUByteArray().toByteArray()
+                val buf = (rtpHeader + amrNothing).map { it.toByte() }.toByteArray()
 
                 val dgramPacket =
                     DatagramPacket(buf, buf.size, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort)

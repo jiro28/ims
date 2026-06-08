@@ -69,8 +69,8 @@ class SipConnectionTcp(
         localPort = socket.localPort
     }
 
-    override fun connect(_remotePort: Int) {
-        remotePort = _remotePort
+    override fun connect(remotePort: Int) {
+        this.remotePort = remotePort
         socket.connect(InetSocketAddress(remoteAddr, remotePort))
         if (_localAddr == null) {
             // localAddr/Port only valid after connect if no explicit bind
@@ -201,8 +201,8 @@ class SipConnectionUdp(
         localPort = socket.localPort
     }
 
-    override fun connect(_remotePort: Int) {
-        remotePort = _remotePort
+    override fun connect(remotePort: Int) {
+        this.remotePort = remotePort
         // Note: DO NOT connect, because the answers might come back from a different IP than where we sent to
         //socket.connect(InetSocketAddress(remoteAddr, remotePort))
         if (_localAddr == null) {

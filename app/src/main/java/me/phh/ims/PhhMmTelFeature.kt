@@ -245,16 +245,16 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         val imsService = PhhImsService.Companion.instance!!
         sipHandler = SipHandler(imsService)
         sipHandler.imsFailureCallback = {
-            imsService.getRegistration(slotId).onDeregistered(null)
+            imsService.getRegistrationForSubscription(slotId, SubscriptionManager.getSubscriptionId(slotId)).onDeregistered(null)
         }
         sipHandler.imsRegisteringCallback = { tech ->
             Rlog.d(TAG, "IMS SIP registering, reporting registration tech $tech")
-            imsService.getRegistration(slotId).onRegistering(tech)
+            imsService.getRegistrationForSubscription(slotId, SubscriptionManager.getSubscriptionId(slotId)).onRegistering(tech)
         }
         sipHandler.imsReadyCallback = {
             val tech = sipHandler.getRegistrationTech()
             Rlog.d(TAG, "IMS SIP registered, reporting registration tech $tech")
-            imsService.getRegistration(slotId).onRegistered(tech)
+            imsService.getRegistrationForSubscription(slotId, SubscriptionManager.getSubscriptionId(slotId)).onRegistered(tech)
             refreshMmTelCapabilities("SIP registered")
         }
         imsSms.sipHandler = sipHandler
@@ -268,7 +268,8 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
                 callerNumber,
                 ImsStreamMediaProfile.AUDIO_QUALITY_EVS_FB,
             )
-            notifyIncomingCall(object: ImsCallSessionImplBase() {
+            @Suppress("DEPRECATION")
+        notifyIncomingCall(object: ImsCallSessionImplBase() {
                 var mState = State.IDLE
                 override fun getCallProfile(): ImsCallProfile {
                     return callProfile
