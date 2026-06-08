@@ -18,6 +18,7 @@ internal class SipSmsHandler(
     private val mySipProvider: () -> String,
     private val writerProvider: () -> OutputStream,
     private val responseCallbackSetter: (String, (SipResponse) -> Boolean) -> Unit,
+    private val smsSipFailureListener: (String, Int) -> Unit = { _, _ -> },
     private val timeoutScheduler: (Long, () -> Unit) -> Unit,
 ) {
     var onSmsReceived: ((Int, String, ByteArray) -> Unit)? = null
@@ -137,6 +138,7 @@ internal class SipSmsHandler(
         )
 
         try {
+            smsSipFailureListener(realmProvider(), response.statusCode)
             pending.failCb()
         } catch (t: Throwable) {
             Rlog.d(tag, "Failed reporting outgoing SMS SIP failure", t)

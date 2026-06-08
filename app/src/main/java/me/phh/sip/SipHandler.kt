@@ -313,6 +313,8 @@ class SipHandler(
 
     private val dispatcher = SipDispatcher(TAG)
 
+    private val inviteSessionTimerPolicy = SipInviteSessionTimerPolicy(TAG)
+    private val smsFallbackPolicy = SipSmsFallbackPolicy(TAG)
     // SIP responses must be written back on the same transport flow that delivered the request.
     // This is especially important for incoming INVITE over the TCP server socket: writing the
     // 180/200 to the registration/control socket can make the P-CSCF ignore the final response.
@@ -362,6 +364,7 @@ private val smsHandler = SipSmsHandler(
         mySipProvider = { mySip },
         writerProvider = { socket.gWriter() },
         responseCallbackSetter = { callId, cb -> setResponseCallback(callId, cb) },
+        smsSipFailureListener = { smsRealm, statusCode -> smsFallbackPolicy.learnFromSipMessageFailure(smsRealm, statusCode) },
         timeoutScheduler = { delayMs, action -> myHandler.postDelayed({ action() }, delayMs) },
     )
 
@@ -2077,8 +2080,57 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         val destination: String,
         val headers: SipHeadersMap,
         val rtpSocket: DatagramSocket,
+        val body: ByteArray,
+        val retriedAfter422: AtomicBoolean = AtomicBoolean(false),
         val cancelSent: AtomicBoolean = AtomicBoolean(false),
     )
+
+
+    private fun retryOutgoingInviteAfter422(
+        pending: PendingOutgoingInvite,
+        response: SipResponse,
+        outgoingDialogNextCseq: AtomicInteger,
+    ): Boolean {
+        val retry = inviteSessionTimerPolicy.buildRetryHeadersAfter422(
+            realm = realm,
+            originalHeaders = pending.headers,
+            response = response,
+        ) ?: return false
+
+        if (!pending.retriedAfter422.compareAndSet(false, true)) {
+            Rlog.w(TAG, "Not retrying outgoing INVITE after 422 twice callId=${pending.callId}")
+            return false
+        }
+
+        val retryInvite = SipRequest(
+            SipMethod.INVITE,
+            pending.destination,
+            retry.headers,
+            pending.body,
+        )
+
+        pendingOutgoingInvite = pending.copy(headers = retryInvite.headers)
+        val desiredNextCseq = retry.cseqNumber + 1
+        while (true) {
+            val oldNextCseq = outgoingDialogNextCseq.get()
+            if (oldNextCseq >= desiredNextCseq ||
+                outgoingDialogNextCseq.compareAndSet(oldNextCseq, desiredNextCseq)
+            ) break
+        }
+
+        Rlog.w(
+            TAG,
+            "Retrying outgoing INVITE after 422 with Min-SE=${retry.minSeSeconds} " +
+                "Session-Expires=${retry.sessionExpiresSeconds} " +
+                "callId=${pending.callId} cseq=${retry.cseqNumber}",
+        )
+        val writer = socket.gWriter()
+        synchronized(writer) {
+            writer.write(retryInvite.toByteArray())
+            writer.flush()
+        }
+        return true
+    }
 
     // AMR-NB speech payload sizes in bits for FT 0..8.
     // Codec input for Android's audio/3gpp decoder is one AMR storage frame:
@@ -2998,6 +3050,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
             val contactTel =
                 """<sip:$myTel@$local;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
+            val outgoingInviteSessionTimer = inviteSessionTimerPolicy.currentForRealm(realm)
             val myHeaders = commonHeaders +
                 """
                     From: <$mySip>
@@ -3010,10 +3063,10 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS
                     P-Early-Media: supported
                     Content-Type: application/sdp
-                    Session-Expires: 900
+                    Session-Expires: ${outgoingInviteSessionTimer.sessionExpiresSeconds}
                     Supported: 100rel, replaces, timer, precondition
                     Accept: application/sdp
-                    Min-SE: 90
+                    Min-SE: ${outgoingInviteSessionTimer.minSeSeconds}
                     Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
                     P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
                     Contact: $contactTel
@@ -3038,6 +3091,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 destination = to,
                 headers = msg.headers,
                 rtpSocket = rtpSocket,
+                body = sdp,
             )
             val prackedReliableProvisionals = mutableSetOf<String>()
             setResponseCallback(outgoingInviteCallId) { r: SipResponse ->
@@ -3211,6 +3265,13 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     }
 
                     if(resp.statusCode >= 400) {
+                        val failedPendingInvite = pendingOutgoingInvite
+                        if (failedPendingInvite != null &&
+                            failedPendingInvite.callId == resp.callIdOrEmpty() &&
+                            retryOutgoingInviteAfter422(failedPendingInvite, resp, outgoingDialogNextCseq)
+                        ) {
+                            return@setResponseCallback false
+                        }
                         val failedCallId = resp.callIdOrEmpty()
                         val failedCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
                         val activeCallId = currentCall?.callIdOrNull()
@@ -4382,6 +4443,11 @@ Content-Length: 0
         successCb: (() -> Unit),
         failCb: (() -> Unit),
     ) {
+        if (smsFallbackPolicy.shouldBypass(realm)) {
+            Rlog.w(TAG, "IMS SMS learned fallback: returning framework fallback without SIP MESSAGE")
+            failCb()
+            return
+        }
         smsHandler.sendSms(smsSmsc, pdu, ref, successCb, failCb)
     }
 
