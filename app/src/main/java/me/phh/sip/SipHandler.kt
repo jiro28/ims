@@ -46,10 +46,41 @@ class SipHandler(
         ipSecManager = ctxt.getSystemService(IpSecManager::class.java)
     }
 
-    private fun createVoiceCommunicationAudioRecord(bufferSize: Int): AudioRecord =
+
+    private data class NegotiatedAudioCodec(
+        val name: String,
+        val mimeType: String,
+        val rtpClockRate: Int,
+        val sampleRate: Int,
+        val channelCount: Int,
+        val bitRate: Int,
+        val frameDurationMs: Int,
+        val rtpTimestampStep: Int,
+        val storageFrameSizeBytes: Int,
+    )
+
+    // Current stable call path: AMR-NB, bandwidth-efficient RTP payload.
+    // AMR-WB/EVS will add new codec profiles later, but should not change
+    // this fallback profile's behavior.
+    private val amrNbCodec = NegotiatedAudioCodec(
+        name = "AMR-NB",
+        mimeType = "audio/3gpp",
+        rtpClockRate = 8000,
+        sampleRate = 8000,
+        channelCount = 1,
+        bitRate = 12200,
+        frameDurationMs = 20,
+        rtpTimestampStep = 160,
+        storageFrameSizeBytes = 32,
+    )
+
+    private fun createVoiceCommunicationAudioRecord(
+        bufferSize: Int,
+        audioCodec: NegotiatedAudioCodec = amrNbCodec,
+    ): AudioRecord =
         AudioRecord(
             MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-            8000,
+            audioCodec.sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             bufferSize,
@@ -1642,14 +1673,19 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         reason: String = "default",
     ) {
         val call = currentCall!!
+        val audioCodec = amrNbCodec
         val gen = callGeneration.get()
         thread {
             rtpSequenceNumber.set(0)
             rtpTimestampSamples.set(0)
-            Rlog.d(TAG, "Encode thread started: amrTrack=${call.amrTrack} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort} gen=$gen")
-            val encoder = MediaCodec.createEncoderByType("audio/3gpp")
-            val mediaFormat = MediaFormat.createAudioFormat("audio/3gpp", 8000, 1)
-            mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, 12200)
+            Rlog.d(TAG, "Encode thread started: codec=${audioCodec.name}/${audioCodec.sampleRate} amrTrack=${call.amrTrack} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort} gen=$gen")
+            val encoder = MediaCodec.createEncoderByType(audioCodec.mimeType)
+            val mediaFormat = MediaFormat.createAudioFormat(
+                audioCodec.mimeType,
+                audioCodec.sampleRate,
+                audioCodec.channelCount,
+            )
+            mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, audioCodec.bitRate)
             mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0) //  0 = realtime priority, encoder will not fall behind
             encoder.configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
@@ -1662,7 +1698,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     return@thread
                 }
                 val sequenceNumber = rtpSequenceNumber.getAndIncrement()
-                val timestamp = rtpTimestampSamples.getAndAdd(160)
+                val timestamp = rtpTimestampSamples.getAndAdd(audioCodec.rtpTimestampStep)
                 Thread.sleep(20)
                 val sendCall = currentCall ?: call
                 val rtpHeader = listOf(
@@ -1715,7 +1751,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             
                     val sequenceNumber = rtpSequenceNumber.getAndIncrement()
             
-                    val timestamp = rtpTimestampSamples.getAndAdd(160)
+                    val timestamp = rtpTimestampSamples.getAndAdd(audioCodec.rtpTimestampStep)
                     val sendCall = currentCall ?: call
                     val rtpHeader = listOf(
                         0x80,
@@ -1757,7 +1793,11 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
 
             // DANGER: Don't open the mic before the user acknowledged opening the call!
 
-            val minBufferSize = AudioRecord.getMinBufferSize(8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val minBufferSize = AudioRecord.getMinBufferSize(
+                audioCodec.sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            )
             if (minBufferSize <= 0) {
                 Rlog.e(TAG, "AudioRecord.getMinBufferSize failed: $minBufferSize")
                 try { encoder.stop() } catch (_: Throwable) { }
@@ -1765,7 +1805,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 return@thread
             }
             val audioRecord = try {
-                createVoiceCommunicationAudioRecord(minBufferSize)
+                createVoiceCommunicationAudioRecord(minBufferSize, audioCodec)
             } catch (t: Throwable) {
                 Rlog.e(TAG, "AudioRecord creation failed with bufferSize=$minBufferSize", t)
                 try { encoder.stop() } catch (_: Throwable) { }
@@ -1862,7 +1902,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
 
                     var bufPos = 0
                     while (bufPos < outBufInfo.size) {
-                        val frameSize = 32
+                        val frameSize = audioCodec.storageFrameSizeBytes
                         if (outBufInfo.size - bufPos < frameSize) break
 
                         // Encoder outputs octet-aligned AMR-NB frames (RFC 4867 §5):
@@ -1890,7 +1930,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
 
                         // Every 20 ms, at 8 kHz, we have 160 samples
                         val sequenceNumber = rtpSequenceNumber.getAndIncrement()
-                        val timestamp = rtpTimestampSamples.getAndAdd(160)
+                        val timestamp = rtpTimestampSamples.getAndAdd(audioCodec.rtpTimestampStep)
                         val sendCall = currentCall ?: break
                         val rtpHeader = byteArrayOf(
                             0x80.toByte(),
@@ -2896,21 +2936,38 @@ a=sendrecv
     }
 
     fun callDecodeThread() {
+        val audioCodec = amrNbCodec
         val gen = callGeneration.get()
         // Receiving thread
         thread {
+            Rlog.d(TAG, "Decode thread started: codec=${audioCodec.name}/${audioCodec.sampleRate} gen=$gen")
             val audioManager = ctxt.getSystemService(android.media.AudioManager::class.java)
             val prevDecodeAudioMode = audioManager.mode
             if (prevDecodeAudioMode != AudioManager.MODE_IN_COMMUNICATION) {
                 Rlog.d(TAG, "Decode thread forcing MODE_IN_COMMUNICATION before AudioTrack: was=$prevDecodeAudioMode")
                 audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
             }
-            val minBufferSize = AudioTrack.getMinBufferSize(8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val audioTrack = AudioTrack(AudioManager.STREAM_VOICE_CALL, 8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize, AudioTrack.MODE_STREAM)
+            val minBufferSize = AudioTrack.getMinBufferSize(
+                audioCodec.sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            )
+            val audioTrack = AudioTrack(
+                AudioManager.STREAM_VOICE_CALL,
+                audioCodec.sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBufferSize,
+                AudioTrack.MODE_STREAM,
+            )
             audioTrack.play()
 
-            val decoder = MediaCodec.createDecoderByType("audio/3gpp")
-            val mediaFormat = MediaFormat.createAudioFormat("audio/3gpp", 8000, 1)
+            val decoder = MediaCodec.createDecoderByType(audioCodec.mimeType)
+            val mediaFormat = MediaFormat.createAudioFormat(
+                audioCodec.mimeType,
+                audioCodec.sampleRate,
+                audioCodec.channelCount,
+            )
             decoder.configure(mediaFormat, null, null, 0)
             decoder.start()
 
