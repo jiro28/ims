@@ -2188,16 +2188,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         prAckWaitTracker.waitFor(v)
     }
 
-    private fun responseHeadersFromRequest(
-        request: SipRequest,
-        toOverride: List<String>? = null,
-        extra: SipHeadersMap = emptyMap(),
-    ): SipHeadersMap = SipDialogHeaderBuilder.responseHeadersFromRequest(
-        request = request,
-        toOverride = toOverride,
-        extra = extra,
-    )
-
     private fun localDialogHeadersForRequest(call: Call, method: SipMethod): SipHeadersMap =
         SipDialogHeaderBuilder.localDialogHeadersForRequest(
             call = call,
@@ -2210,17 +2200,17 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val callId = request.callIdOrEmpty()
         val call = currentCall
         val currentCallId = call?.callIdOrNull()
-        Rlog.d(TAG, "Received ACK for call-id=$callId current=$currentCallId outgoing=${call?.outgoing}")
+        Rlog.d(TAG, SipAckHandling.receivedLog(callId, currentCallId, call?.outgoing))
         if (call != null && !call.outgoing && currentCallId == callId) {
             callStarted.set(true)
             incomingAcceptedAwaitingAck.set(false)
 
             if (threadsStarted.compareAndSet(false, true)) {
-                Rlog.d(TAG, "Starting incoming media threads from final ACK")
+                Rlog.d(TAG, SipAckHandling.startIncomingMediaLog())
                 callDecodeThread()
                 callEncodeThread(callSnapshot = call)
             } else {
-                Rlog.d(TAG, "Incoming media threads already started before final ACK")
+                Rlog.d(TAG, SipAckHandling.incomingMediaAlreadyStartedLog())
             }
 
             onIncomingCallConnected?.invoke(
@@ -2229,20 +2219,24 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             )
 
             if (incomingHangupAfterAck.getAndSet(false)) {
-                Rlog.d(TAG, "ACK received after local pre-ACK hangup; sending deferred BYE")
+                Rlog.d(TAG, SipRemoteDialogTermination.deferredLocalByeAfterAckLog())
                 sendByeForCall(call)
-                rememberTerminatedIncomingCall(callId, "deferred local BYE after ACK")
+                rememberTerminatedIncomingCall(
+                    callId,
+                    SipRemoteDialogTermination.deferredLocalByeAfterAckReason(),
+                )
             currentCall = null
             }
         }
-        return 0
+        return SipAckHandling.okStatus()
     }
 
     fun handlePrack(request: SipRequest): Int {
-        Rlog.d(TAG, "Received PRACK for ${request.headers["rack"]!![0]}")
-        val id = request.headers["rack"]!![0].split(" ")[0].toInt()
+        val rackHeader = SipPrackHandling.rackHeader(request)
+        Rlog.d(TAG, SipPrackHandling.receivedLog(rackHeader))
+        val id = SipPrackHandling.rackId(rackHeader)
         prAckWaitTracker.ack(id)
-        return 200
+        return SipPrackHandling.okStatus()
     }
 
 
@@ -2251,224 +2245,24 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         return updateCallId?.let { dispatcher.writerForCallId(it) } ?: socket.gWriter()
     }
 
-    private fun writeUpdateReply(
-        updateResponseWriter: java.io.OutputStream,
-        reply: SipResponse,
-    ) {
-        Rlog.d(TAG, "Replying to UPDATE with $reply")
-        synchronized(updateResponseWriter) {
-            updateResponseWriter.write(reply.toByteArray())
-        }
-    }
-
-    private fun okUpdateWithoutSdpResponse(
-        request: SipRequest,
-        requestCallId: String,
-    ): SipResponse {
-        return SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = request.headers.filter { (k, _) ->
-                k in listOf("cseq", "via", "from", "to", "call-id")
-            } + """
-                Supported: 100rel, replaces, timer
-                Call-ID: $requestCallId
-                Content-Length: 0
-            """.toSipHeadersMap(),
-            autofill = false,
-        )
-    }
 
 
-    private data class UpdateSdpOffer(
-        val rtpRemoteAddr: InetAddress,
-        val rtpRemotePort: Int,
-        val offeredPayloads: Set<Int>,
-        val attributes: List<String>,
-    )
-
-    private fun parseUpdateSdpOffer(
-        request: SipRequest,
-        requestCallId: String,
-        requestCseq: String,
-    ): UpdateSdpOffer? {
-        val sdp = request.body
-            .toString(Charsets.UTF_8)
-            .split("[\\r\\n]+".toRegex())
-            .filter { it.isNotBlank() }
-
-        Rlog.d(TAG, "Handling UPDATE SDP offer: callId=$requestCallId cseq=$requestCseq sdp=$sdp")
-
-        fun sdpElement(command: String): String? {
-            val v = sdp.firstOrNull { it.startsWith("$command=") } ?: return null
-            return v.substring(2)
-        }
-
-        val sdpConnectionData = sdpElement("c")
-        val sdpMedia = sdpElement("m")
-        if (sdpConnectionData == null || sdpMedia == null) {
-            Rlog.w(TAG, "Rejecting UPDATE without usable c=/m= SDP: callId=$requestCallId cseq=$requestCseq")
-            return null
-        }
-
-        val rtpRemote = sdpConnectionData.split(" ").getOrNull(2)
-        val rtpRemoteAddr = rtpRemote?.let { InetAddress.getByName(it) }
-        val mediaParts = sdpMedia.trim().split("\\s+".toRegex())
-        val rtpRemotePort = mediaParts.getOrNull(1)?.toIntOrNull()
-        val offeredPayloads = mediaParts.drop(3).mapNotNull { it.toIntOrNull() }.toSet()
-
-        if (rtpRemoteAddr == null || rtpRemotePort == null || offeredPayloads.isEmpty()) {
-            Rlog.w(
-                TAG,
-                "Rejecting UPDATE with incomplete media address/payloads: " +
-                    "callId=$requestCallId cseq=$requestCseq c=$sdpConnectionData m=$sdpMedia",
-            )
-            return null
-        }
-
-        SipAudioCodecSdpLogger.logRemoteAudioCodecCandidates(
-            tag = TAG,
-            context = "remote SDP ${request.method} callId=${request.callIdOrEmpty()}",
-            sdp = sdp,
-        )
-
-        return UpdateSdpOffer(
-            rtpRemoteAddr = rtpRemoteAddr,
-            rtpRemotePort = rtpRemotePort,
-            offeredPayloads = offeredPayloads,
-            attributes = sdp.filter { it.startsWith("a=") }.map { it.substring(2) },
-        )
-    }
 
 
-    private fun updateTrackRequirements(
-        attributes: List<String>,
-        track: Int,
-    ): String? {
-        return attributes.firstOrNull { it.startsWith("fmtp:$track") }
-    }
-
-    private fun lookUpdateTrackMatching(
-        attributes: List<String>,
-        offeredPayloads: Set<Int>,
-        codec: String,
-        additional: String = "",
-        notAdditional: String = "",
-    ): Pair<Int, String>? {
-        val maps = attributes.filter { it.startsWith("rtpmap:") && it.contains(codec) }
-        val matches = maps.mapNotNull { m ->
-            val track = m.split("[: ]+".toRegex()).getOrNull(1)?.toIntOrNull()
-            if (track != null && offeredPayloads.contains(track)) Pair(track, m) else null
-        }
-        val sorted = matches.sortedBy { m ->
-            val fmtp = updateTrackRequirements(attributes, m.first).orEmpty()
-            when {
-                // Our RTP encoder currently sends AMR-NB bandwidth-efficient frames.
-                // SDP without octet-align defaults to octet-align=0, so prefer that
-                // over octet-align=1 when carriers offer both forms in UPDATE.
-                codec.startsWith("AMR") && fmtp.contains("octet-align=1", ignoreCase = true) -> 100
-                codec.startsWith("AMR") && fmtp.isEmpty() -> 0
-                notAdditional.isNotEmpty() && fmtp.contains(notAdditional, ignoreCase = true) -> 90
-                additional.isNotEmpty() && fmtp.contains(additional, ignoreCase = true) -> 0
-                else -> 10
-            }
-        }
-        Rlog.d(TAG, "UPDATE matching $codec offered=$offeredPayloads got=$sorted")
-        return sorted.firstOrNull()
-    }
 
 
-    private fun connectUpdateRtpSocketIfNeeded(
-        call: Call,
-        rtpRemoteAddr: InetAddress,
-        rtpRemotePort: Int,
-        requestCallId: String,
-    ) {
-        try {
-            if (!call.rtpSocket.isConnected ||
-                call.rtpSocket.inetAddress != rtpRemoteAddr ||
-                call.rtpSocket.port != rtpRemotePort) {
-                call.rtpSocket.connect(rtpRemoteAddr, rtpRemotePort)
-                Rlog.d(
-                    TAG,
-                    "UPDATE connected RTP socket to ${rtpRemoteAddr}:${rtpRemotePort} " +
-                        "local=${call.rtpSocket.localAddress}:${call.rtpSocket.localPort} callId=$requestCallId",
-                )
-            }
-        } catch (t: Throwable) {
-            Rlog.w(TAG, "Failed to connect RTP socket from UPDATE to ${rtpRemoteAddr}:${rtpRemotePort} callId=$requestCallId", t)
-        }
-    }
 
 
-    private fun buildUpdateAnswerSdp(
-        request: SipRequest,
-        call: Call,
-        attributes: List<String>,
-        amrTrack: Int,
-        amrTrackDesc: String,
-        amrFmtpAnswer: String,
-        dtmfTrack: Int,
-        dtmfTrackDesc: String,
-    ): ByteArray {
-        val selectedAudioCodec = call.audioCodec
-        val allTracks = listOf(amrTrack, dtmfTrack)
-        val ipType = if (socket.gLocalAddr() is Inet6Address) "IP6" else "IP4"
-        val owner = request.destination.substringAfter("sip:").substringBefore("@").ifBlank { "-" }
-        val sdpVersion = call.localSdpVersion.incrementAndGet()
-        val remoteMaxptime = attributes.firstOrNull { it.startsWith("maxptime:") } ?: "maxptime:240"
-        val sdpBandwidthAs = SipAudioCodecNegotiator.sdpBandwidthAsKbps(selectedAudioCodec)
-
-        val answerSdpLines = listOf(
-            "v=0",
-            "o=$owner 1 $sdpVersion IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "s=phh voice call",
-            "c=IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "b=AS:$sdpBandwidthAs",
-            "b=RS:0",
-            "b=RR:0",
-            "t=0 0",
-            "m=audio ${call.rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}",
-            "b=AS:$sdpBandwidthAs",
-            "b=RS:0",
-            "b=RR:0",
-            "a=$amrTrackDesc",
-            "a=ptime:20",
-            "a=$remoteMaxptime",
-            "a=$dtmfTrackDesc",
-            "a=$amrFmtpAnswer",
-            "a=fmtp:$dtmfTrack 0-15",
-            "a=curr:qos local sendrecv",
-            "a=curr:qos remote sendrecv",
-            "a=des:qos mandatory local sendrecv",
-            "a=des:qos mandatory remote sendrecv",
-            "a=conf:qos remote sendrecv",
-            "a=sendrecv",
-        )
-
-        return answerSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
-    }
 
 
-    private fun okUpdateWithSdpResponse(
-        request: SipRequest,
-        callId: String,
-        answerSdp: ByteArray,
-    ): SipResponse {
-        return SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = request.headers.filter { (k, _) ->
-                k in listOf("cseq", "via", "from", "to", "call-id")
-            } + """
-                Content-Type: application/sdp
-                Supported: 100rel, replaces, timer
-                Require: precondition
-                Call-ID: $callId
-            """.toSipHeadersMap(),
-            body = answerSdp,
-        )
-    }
+
+
+
+
+
+
+
+
 
 
     private fun updateCurrentCallFromUpdateSdp(
@@ -2482,117 +2276,74 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         rtpRemoteAddr: InetAddress,
         rtpRemotePort: Int,
     ): Call {
-        val updatedCall = call.copy(
+        val updateState = SipUpdateSdpCallUpdate.state(
+            request = request,
+            answerSdp = answerSdp,
             amrTrack = amrTrack,
             amrTrackDesc = amrTrackDesc,
             dtmfTrack = dtmfTrack,
             dtmfTrackDesc = dtmfTrackDesc,
             rtpRemoteAddr = rtpRemoteAddr,
             rtpRemotePort = rtpRemotePort,
-            sdp = answerSdp,
-            remoteContact = request.headers["contact"]?.getOrNull(0)
-                ?.let { extractDestinationFromContact(it) }
-                ?: call.remoteContact,
+            fallbackRemoteContact = call.remoteContact,
+            extractDestinationFromContact = { contact -> extractDestinationFromContact(contact) },
+        )
+        val updatedCall = call.copy(
+            amrTrack = updateState.amrTrack,
+            amrTrackDesc = updateState.amrTrackDesc,
+            dtmfTrack = updateState.dtmfTrack,
+            dtmfTrackDesc = updateState.dtmfTrackDesc,
+            rtpRemoteAddr = updateState.rtpRemoteAddr,
+            rtpRemotePort = updateState.rtpRemotePort,
+            sdp = updateState.answerSdp,
+            remoteContact = updateState.remoteContact,
         )
         currentCall = updatedCall
         return updatedCall
     }
 
 
-    private fun sendIncomingUpdateRingingIfNeeded(
+
+
+    private data class UpdateSdpAnswerState(
+        val updatedCall: Call,
+        val answerSdp: ByteArray,
+    )
+
+    private fun prepareUpdateSdpAnswer(
+        request: SipRequest,
         call: Call,
-        updateResponseWriter: java.io.OutputStream,
-    ) {
-        if (call.outgoing) {
-            return
-        }
-
-        val myHeaders2 = call.callHeaders - "rseq" - "content-type" - "require"
-        val msg2 = SipResponse(
-            statusCode = 180,
-            statusString = "Ringing",
-            headersParam = myHeaders2,
-        )
-        Rlog.d(TAG, "Sending $msg2")
-        synchronized(updateResponseWriter) {
-            updateResponseWriter.write(msg2.toByteArray())
-        }
-    }
-
-    fun handleUpdate(request: SipRequest): Int {
-        val requestCallId = request.callIdOrEmpty()
-        val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
-        val call = currentCall
-        val currentCallId = call?.callIdOrNull()
-
-        if (call == null || currentCallId != requestCallId) {
-            Rlog.w(TAG, "Rejecting UPDATE for non-current dialog: callId=$requestCallId cseq=$requestCseq current=$currentCallId")
-            return 481
-        }
-
-        val updateResponseWriter = updateResponseWriterFor(request)
-
-        val isSdp = request.headers["content-type"]
-            ?.getOrNull(0)
-            ?.startsWith("application/sdp", ignoreCase = true) == true &&
-            request.body.isNotEmpty()
-
-        if (!isSdp) {
-            val reply = okUpdateWithoutSdpResponse(
-                request = request,
-                requestCallId = requestCallId,
-            )
-            writeUpdateReply(updateResponseWriter, reply)
-            return 0
-        }
-
-        val updateSdpOffer = parseUpdateSdpOffer(
-            request = request,
-            requestCallId = requestCallId,
-            requestCseq = requestCseq,
-        ) ?: return 488
+        requestCallId: String,
+        updateSdpOffer: UpdateSdpOffer,
+    ): UpdateSdpAnswerState? {
         val rtpRemoteAddr = updateSdpOffer.rtpRemoteAddr
         val rtpRemotePort = updateSdpOffer.rtpRemotePort
         val offeredPayloads = updateSdpOffer.offeredPayloads
         val attributes = updateSdpOffer.attributes
 
-        // Keep the selected speech payload first in SDP answers. Sorting payload IDs can
-        // put telephone-event before AMR-WB, e.g. m=audio ... 96 104, which some
-        // IMS cores reject as an offer/answer error during precondition UPDATE.
-        val selectedAudioCodec = call.audioCodec
-        val amr = lookUpdateTrackMatching(
+        val mediaSelection = SipUpdateSdpMediaSelector.select(
+            logTag = TAG,
             attributes = attributes,
             offeredPayloads = offeredPayloads,
-            codec = SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec),
-            notAdditional = "octet-align=1",
-        )
-        if (amr == null) {
-            Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
-            return 488
-        }
-        val (amrTrack, amrTrackDesc) = amr
-        val amrFmtpAnswer = updateTrackRequirements(attributes, amrTrack)
-            ?: SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(amrTrack, selectedAudioCodec)
+            selectedAudioCodec = call.audioCodec,
+            requestCallId = requestCallId,
+        ) ?: return null
+        val selectedAudioCodec = mediaSelection.selectedAudioCodec
+        val amrTrack = mediaSelection.amrTrack
+        val amrTrackDesc = mediaSelection.amrTrackDesc
+        val amrFmtpAnswer = mediaSelection.amrFmtpAnswer
+        val dtmfTrack = mediaSelection.dtmfTrack
+        val dtmfTrackDesc = mediaSelection.dtmfTrackDesc
 
-        val dtmf = lookUpdateTrackMatching(
-            attributes = attributes,
-            offeredPayloads = offeredPayloads,
-            codec = SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec),
-        )
-        if (dtmf == null) {
-            Rlog.w(TAG, "Rejecting UPDATE: no compatible ${SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec)} payload in offer callId=$requestCallId offered=$offeredPayloads")
-            return 488
-        }
-        val (dtmfTrack, dtmfTrackDesc) = dtmf
-
-        connectUpdateRtpSocketIfNeeded(
+        SipUpdateRtpEndpointConnector.connectIfNeeded(
             call = call,
             rtpRemoteAddr = rtpRemoteAddr,
             rtpRemotePort = rtpRemotePort,
             requestCallId = requestCallId,
+            logTag = TAG,
         )
 
-        val answerSdp = buildUpdateAnswerSdp(
+        val answerSdp = SipUpdateSdpAnswerBuilder.build(
             request = request,
             call = call,
             attributes = attributes,
@@ -2601,6 +2352,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             amrFmtpAnswer = amrFmtpAnswer,
             dtmfTrack = dtmfTrack,
             dtmfTrackDesc = dtmfTrackDesc,
+            localAddr = socket.gLocalAddr(),
         )
 
         val updatedCall = updateCurrentCallFromUpdateSdp(
@@ -2615,33 +2367,68 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             rtpRemotePort = rtpRemotePort,
         )
 
-        val reply = okUpdateWithSdpResponse(
-            request = request,
-            callId = updatedCall.callIdOrEmpty(),
+        return UpdateSdpAnswerState(
+            updatedCall = updatedCall,
             answerSdp = answerSdp,
         )
-        writeUpdateReply(updateResponseWriter, reply)
+    }
 
-        sendIncomingUpdateRingingIfNeeded(
+    fun handleUpdate(request: SipRequest): Int {
+        val requestCallId = request.callIdOrEmpty()
+        val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
+        val call = currentCall
+        val currentCallId = call?.callIdOrNull()
+
+        if (call == null || currentCallId != requestCallId) {
+            Rlog.w(
+                TAG,
+                SipUpdateDialogValidator.nonCurrentDialogLog(
+                    requestCallId = requestCallId,
+                    requestCseq = requestCseq,
+                    currentCallId = currentCallId,
+                ),
+            )
+            return SipUpdateDialogValidator.nonCurrentDialogStatus()
+        }
+
+        val updateResponseWriter = updateResponseWriterFor(request)
+
+        val isSdp = SipUpdateDialogValidator.isSdpUpdate(request)
+
+        if (!isSdp) {
+            SipUpdateResponseWriter.writeOkWithoutSdp(
+                request = request,
+                requestCallId = requestCallId,
+                updateResponseWriter = updateResponseWriter,
+                logTag = TAG,
+            )
+            return 0
+        }
+
+        val updateSdpOffer = SipUpdateSdpOfferParser.parse(
+            request = request,
+            requestCallId = requestCallId,
+            requestCseq = requestCseq,
+            logTag = TAG,
+        ) ?: return 488
+        val updateSdpAnswerState = prepareUpdateSdpAnswer(
+            request = request,
+            call = call,
+            requestCallId = requestCallId,
+            updateSdpOffer = updateSdpOffer,
+        ) ?: return 488
+
+        SipUpdateResponseWriter.writeSdpAnswerAndRingingIfNeeded(
+            request = request,
             call = call,
             updateResponseWriter = updateResponseWriter,
+            updatedCallId = updateSdpAnswerState.updatedCall.callIdOrEmpty(),
+            answerSdp = updateSdpAnswerState.answerSdp,
+            logTag = TAG,
         )
 
         return 0
     }
-
-    private fun remoteEndExtras(
-        callId: String,
-        terminatedCall: Call?,
-        isBye: Boolean,
-    ): Map<String, String> = SipRemoteEndExtrasBuilder.build(
-        logTag = TAG,
-        callId = callId,
-        isBye = isBye,
-        isOutgoingCall = terminatedCall?.outgoing == true,
-        outgoingConnectedNotified = terminatedCall?.outgoingConnectedNotified?.get() == true,
-    )
-
 
     private fun acknowledgeLateCancelAfterFinalResponse(
         request: SipRequest,
@@ -2651,22 +2438,18 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             return false
         }
 
-        Rlog.d(TAG, "CANCEL received after final 200 OK was sent — replying 200 to CANCEL and keeping answered dialog")
+        Rlog.d(TAG, SipRemoteDialogTermination.lateCancelReceivedAfterFinalResponseLog())
         val toOverride = currentCall?.callHeaders?.get("to") ?: request.headers["to"]
-        val responseHeaders = responseHeadersFromRequest(
-            request,
+        val response = SipRemoteDialogTermination.lateCancelOkResponse(
+            request = request,
             toOverride = toOverride,
-            extra = "Content-Length: 0".toSipHeadersMap(),
         )
-        val response = SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = responseHeaders,
-            autofill = false
-        )
-        Rlog.d(TAG, "Sending explicit 200 OK to late CANCEL: $response")
+        Rlog.d(TAG, SipRemoteDialogTermination.lateCancelOkLog(response))
         val cancelResponseWriter = dispatcher.writerForCallId(callId) ?: currentCall?.incomingResponseWriter ?: socket.gWriter()
-        synchronized(cancelResponseWriter) { cancelResponseWriter.write(response.toByteArray()) }
+        SipRemoteDialogTermination.writeResponse(
+            responseWriter = cancelResponseWriter,
+            response = response,
+        )
 
         return true
     }
@@ -2685,44 +2468,38 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         // RFC 3261: CANCEL is its own transaction. Reply 200 OK to the CANCEL,
         // then terminate the original INVITE transaction with 487 using CSeq: INVITE.
         // Do not let parseMessage emit an extra generic 200 OK with a different To tag.
-        val cancelOkHeaders = responseHeadersFromRequest(
-            request,
+        val cancelOk = SipRemoteDialogTermination.cancelOkResponse(
+            request = request,
             toOverride = toOverride,
-            extra = "Content-Length: 0".toSipHeadersMap(),
         )
-        val cancelOk = SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = cancelOkHeaders,
-            autofill = false
+        Rlog.d(TAG, SipRemoteDialogTermination.cancelOkLog(cancelOk))
+        SipRemoteDialogTermination.writeResponse(
+            responseWriter = cancelResponseWriter,
+            response = cancelOk,
         )
-        Rlog.d(TAG, "Sending 200 OK to CANCEL $cancelOk")
-        synchronized(cancelResponseWriter) { cancelResponseWriter.write(cancelOk.toByteArray()) }
 
-        val originalInviteCseq = request.headers["cseq"]?.getOrNull(0)
-            ?.replace(Regex("\\bCANCEL\\b", RegexOption.IGNORE_CASE), "INVITE")
-            ?: "1 INVITE"
-        val inviteTerminatedHeaders = responseHeadersFromRequest(
-            request,
+        val inviteTerminated = SipRemoteDialogTermination.cancelledInviteResponse(
+            request = request,
             toOverride = toOverride,
-            extra = """
-                CSeq: $originalInviteCseq
-                Content-Length: 0
-                """.toSipHeadersMap(),
         )
-        val inviteTerminated = SipResponse(
-            statusCode = 487,
-            statusString = "Request Terminated",
-            headersParam = inviteTerminatedHeaders,
-            autofill = false
+        Rlog.d(TAG, SipRemoteDialogTermination.cancelledInviteLog(inviteTerminated))
+        SipRemoteDialogTermination.writeResponse(
+            responseWriter = cancelResponseWriter,
+            response = inviteTerminated,
         )
-        Rlog.d(TAG, "Sending 487 for cancelled INVITE $inviteTerminated")
-        synchronized(cancelResponseWriter) { cancelResponseWriter.write(inviteTerminated.toByteArray()) }
 
-        rememberTerminatedIncomingCall(callId, "remote CANCEL")
+        rememberTerminatedIncomingCall(callId, SipRemoteDialogTermination.remoteCancelTerminationReason())
         currentCall = null
-        clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = "remote CANCEL")
-        onCancelledCall?.invoke(Object(), "", mapOf("call-id" to callId))
+        clearPendingOutgoingInvite(
+            callId,
+            closeRtpSocket = false,
+            reason = SipRemoteDialogTermination.remoteCancelTerminationReason(),
+        )
+        onCancelledCall?.invoke(
+            Object(),
+            "",
+            SipRemoteDialogTermination.remoteCancelCancellationExtras(callId),
+        )
         return true
     }
 
@@ -2732,14 +2509,21 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         isBye: Boolean,
     ): Int {
         if (!isBye) {
-            Rlog.w(TAG, "handleCancel called for unexpected method ${request.method}")
+            Rlog.w(TAG, SipRemoteDialogTermination.unexpectedNonByeDialogTerminationLog(request.method))
         }
 
-        if (currentCall?.outgoing == false) rememberTerminatedIncomingCall(callId, "remote ${request.method}")
+        val remoteMethodReason = SipRemoteDialogTermination.remoteMethodReason(request.method)
+        if (currentCall?.outgoing == false) rememberTerminatedIncomingCall(callId, remoteMethodReason)
         val terminatedCall = currentCall
         currentCall = null
-        clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = "remote ${request.method}")
-        val cancelExtras = remoteEndExtras(callId, terminatedCall, isBye)
+        clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = remoteMethodReason)
+        val cancelExtras = SipRemoteDialogTermination.remoteEndExtras(
+            logTag = TAG,
+            callId = callId,
+            isBye = isBye,
+            isOutgoingCall = terminatedCall?.outgoing == true,
+            outgoingConnectedNotified = terminatedCall?.outgoingConnectedNotified?.get() == true,
+        )
         onCancelledCall?.invoke(Object(), "", cancelExtras)
         return 200
     }
@@ -2762,10 +2546,10 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             )
         ) return 0
 
-        stopCallRuntime("call cleanup")
+        stopCallRuntime(SipRemoteDialogTermination.cleanupReason())
         prAckWaitTracker.clearAndNotifyAll()
 
-        Rlog.d(TAG, "Cancelled call $callId method=${request.method}")
+        Rlog.d(TAG, SipRemoteDialogTermination.cancelledCallLog(callId, request.method))
 
         if (handleRemoteCancelTransaction(
                 request = request,
@@ -2798,132 +2582,41 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val localCseq: AtomicInteger = AtomicInteger(2),
         val localSdpVersion: AtomicInteger = AtomicInteger(2), val outgoingRtpReceived: AtomicBoolean = AtomicBoolean(false), val outgoingConnectedNotified: AtomicBoolean = AtomicBoolean(false), )
 
-    private data class PendingOutgoingInvite(
-        val callId: String,
-        val destination: String,
-        val headers: SipHeadersMap,
-        val rtpSocket: DatagramSocket,
-        val body: ByteArray,
-        val retriedAfter422: AtomicBoolean = AtomicBoolean(false),
-        val retriedAfterIllegalSdp: AtomicBoolean = AtomicBoolean(false),
-        val cancelSent: AtomicBoolean = AtomicBoolean(false),
-    )
-
-
     // illegal SDP conservative retry: retry once only when the SBC explicitly rejects the SDP body.
-    private fun responseWarnsIllegalSdp(response: SipResponse): Boolean {
-        if (response.statusCode != 400) return false
-        val warningValues = response.headers.entries
-            .filter { it.key.equals("warning", ignoreCase = true) }
-            .flatMap { it.value }
-        return warningValues.any { warning ->
-            warning.contains("SDP is illegal", ignoreCase = true) ||
-                warning.contains("illegal SDP", ignoreCase = true)
-        }
-    }
 
-    private fun removeSipHeaderToken(
-        headers: SipHeadersMap,
-        headerName: String,
-        token: String,
-    ): SipHeadersMap {
-        val values = headers.entries
-            .filter { it.key.equals(headerName, ignoreCase = true) }
-            .flatMap { it.value }
-        if (values.isEmpty()) return headers
 
-        val filteredValues = values.mapNotNull { value ->
-            val keptTokens = value.split(',')
-                .map { it.trim() }
-                .filter { it.isNotEmpty() && !it.equals(token, ignoreCase = true) }
-            if (keptTokens.isEmpty()) null else keptTokens.joinToString(", ")
-        }
-        val strippedHeaders = headers.filterKeys { !it.equals(headerName, ignoreCase = true) }
-        return if (filteredValues.isEmpty()) {
-            strippedHeaders
-        } else {
-            strippedHeaders + (headerName.lowercase() to filteredValues)
-        }
-    }
 
-    private fun outgoingInviteIllegalSdpRetryHeaders(
-        headers: SipHeadersMap,
-        retryCseq: Int,
-    ): SipHeadersMap {
-        var retryHeaders = headers.filterKeys {
-            !it.equals("cseq", ignoreCase = true) &&
-                !it.equals("content-length", ignoreCase = true)
-        } + ("cseq" to listOf("$retryCseq INVITE"))
-        retryHeaders = removeSipHeaderToken(retryHeaders, "supported", "precondition")
-        retryHeaders = removeSipHeaderToken(retryHeaders, "require", "precondition")
-        return retryHeaders
-    }
 
-    private fun conservativeAmrNbOutgoingInviteSdpBody(originalBody: ByteArray): ByteArray {
-        val originalLines = originalBody
-            .toString(Charsets.US_ASCII)
-            .split(Regex("\r?\n"))
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
 
-        fun line(prefix: String): String? = originalLines.firstOrNull { it.startsWith(prefix) }
-        val localHost = socket.gLocalAddr().hostAddress ?: "0.0.0.0"
-        val ipType = if (localHost.contains(':')) "IP6" else "IP4"
-        val audioPort = line("m=audio ")?.split(Regex("\\s+"))?.getOrNull(1) ?: "0"
 
-        val retryLines = listOf(
-            line("v=") ?: "v=0",
-            line("o=") ?: "o=- 1 2 IN $ipType $localHost",
-            line("s=") ?: "s=phh voice call",
-            line("c=") ?: "c=IN $ipType $localHost",
-            "b=AS:38",
-            "b=RS:0",
-            "b=RR:0",
-            line("t=") ?: "t=0 0",
-            "m=audio $audioPort RTP/AVP 97 100",
-            "b=AS:38",
-            "b=RS:0",
-            "b=RR:0",
-            "a=ptime:20",
-            "a=maxptime:240",
-            "a=rtpmap:97 AMR/8000/1",
-            "a=fmtp:97 mode-change-capability=2;octet-align=0;max-red=0",
-            "a=rtpmap:100 telephone-event/8000",
-            "a=fmtp:100 0-15",
-            "a=sendrecv",
-        )
-        return (retryLines.joinToString("\r\n") + "\r\n").toByteArray(Charsets.US_ASCII)
-    }
+
 
     private fun retryOutgoingInviteAfterIllegalSdp(
         pending: PendingOutgoingInvite,
         response: SipResponse,
         outgoingDialogNextCseq: AtomicInteger,
     ): Boolean {
-        if (!responseWarnsIllegalSdp(response)) return false
+        if (!SipOutgoingInviteRetryPolicy.responseWarnsIllegalSdp(response)) return false
         if (pending.cancelSent.get()) {
-            Rlog.w(TAG, "Not retrying outgoing INVITE after illegal SDP because CANCEL was already sent callId=${pending.callId}")
+            Rlog.w(TAG, SipOutgoingInviteRetryPolicy.notRetryingIllegalSdpAfterCancelLog(pending.callId))
             return false
         }
         if (!pending.retriedAfterIllegalSdp.compareAndSet(false, true)) {
-            Rlog.w(TAG, "Not retrying outgoing INVITE after illegal SDP twice callId=${pending.callId}")
+            Rlog.w(TAG, SipOutgoingInviteRetryPolicy.notRetryingIllegalSdpTwiceLog(pending.callId))
             return false
         }
 
-        val oldCseqHeader = pending.headers.entries
-            .firstOrNull { it.key.equals("cseq", ignoreCase = true) }
-            ?.value
-            ?.getOrNull(0)
-            ?: "1 INVITE"
-        val oldCseq = oldCseqHeader.substringBefore(" ").trim().toIntOrNull() ?: 1
-        val retryCseq = oldCseq + 1
-        val retryBody = conservativeAmrNbOutgoingInviteSdpBody(pending.body)
-        val retryHeaders = outgoingInviteIllegalSdpRetryHeaders(pending.headers, retryCseq)
-        val retryInvite = SipRequest(
-            SipMethod.INVITE,
-            pending.destination,
-            retryHeaders,
-            retryBody,
+        val oldCseq = SipOutgoingInviteRetryPolicy.originalInviteCseq(pending.headers)
+        val retryCseq = SipOutgoingInviteRetryPolicy.nextInviteCseq(oldCseq)
+        val retryBody = SipOutgoingInviteRetryPolicy.conservativeAmrNbRetryBody(
+            originalBody = pending.body,
+            localHost = socket.gLocalAddr().hostAddress ?: "0.0.0.0",
+        )
+        val retryHeaders = SipOutgoingInviteRetryPolicy.retryHeaders(pending.headers, retryCseq)
+        val retryInvite = SipOutgoingInviteRetryPolicy.illegalSdpRetryInvite(
+            destination = pending.destination,
+            retryHeaders = retryHeaders,
+            retryBody = retryBody,
         )
 
         pendingOutgoingInvite = pending.copy(
@@ -2941,12 +2634,20 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         Rlog.w(
             TAG,
-            "Retrying outgoing INVITE after 400 illegal SDP with conservative AMR-NB offer " +
-                "callId=${pending.callId} oldCseq=$oldCseq retryCseq=$retryCseq " +
-                "oldBytes=${pending.body.size} retryBytes=${retryBody.size} " +
-                imsDualSimDebugContext(),
+            SipOutgoingInviteRetryPolicy.illegalSdpRetryLog(
+                callId = pending.callId,
+                oldCseq = oldCseq,
+                retryCseq = retryCseq,
+                oldBytes = pending.body.size,
+                retryBytes = retryBody.size,
+                dualSimDebugContext = imsDualSimDebugContext(),
+            ),
         )
-        writeSipBytesWithFlush(socket.gWriter(), "SipHandler illegal-sdp retry INVITE", retryInvite.toByteArray())
+        writeSipBytesWithFlush(
+            socket.gWriter(),
+            SipOutgoingInviteRetryPolicy.illegalSdpRetryWriteLabel(),
+            retryInvite.toByteArray(),
+        )
         return true
     }
 
@@ -2963,19 +2664,18 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         ) ?: return false
 
         if (!pending.retriedAfter422.compareAndSet(false, true)) {
-            Rlog.w(TAG, "Not retrying outgoing INVITE after 422 twice callId=${pending.callId}")
+            Rlog.w(TAG, SipOutgoingInviteRetryPolicy.notRetryingAfter422TwiceLog(pending.callId))
             return false
         }
 
-        val retryInvite = SipRequest(
-            SipMethod.INVITE,
-            pending.destination,
-            retry.headers,
-            pending.body,
+        val retryInvite = SipOutgoingInviteRetryPolicy.retryInviteAfter422(
+            destination = pending.destination,
+            retryHeaders = retry.headers,
+            body = pending.body,
         )
 
         pendingOutgoingInvite = pending.copy(headers = retryInvite.headers)
-        val desiredNextCseq = retry.cseqNumber + 1
+        val desiredNextCseq = SipOutgoingInviteRetryPolicy.desiredNextCseqAfter422Retry(retry.cseqNumber)
         while (true) {
             val oldNextCseq = outgoingDialogNextCseq.get()
             if (oldNextCseq >= desiredNextCseq ||
@@ -2985,9 +2685,12 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         Rlog.w(
             TAG,
-            "Retrying outgoing INVITE after 422 with Min-SE=${retry.minSeSeconds} " +
-                "Session-Expires=${retry.sessionExpiresSeconds} " +
-                "callId=${pending.callId} cseq=${retry.cseqNumber}",
+            SipOutgoingInviteRetryPolicy.retryAfter422Log(
+                callId = pending.callId,
+                minSeSeconds = retry.minSeSeconds,
+                sessionExpiresSeconds = retry.sessionExpiresSeconds,
+                cseqNumber = retry.cseqNumber,
+            ),
         )
         val writer = socket.gWriter()
         synchronized(writer) {
@@ -3049,7 +2752,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                     audioCodec = audioCodec,
                     sequenceNumber = sequenceNumber,
                     timestamp = timestamp,
-                    label = "RTP packet #$sequenceNumber",
+                    label = SipUplinkEncodeThreadLog.rtpPacketLabel(sequenceNumber),
                 )
             },
             cleanupOnExit = {
@@ -3087,7 +2790,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                     audioCodec = audioCodec,
                     sequenceNumber = sequenceNumber,
                     timestamp = timestamp,
-                    label = "incoming RTP settle silence #$sequenceNumber",
+                    label = SipUplinkEncodeThreadLog.incomingSettleSilenceLabel(sequenceNumber),
                 )
             },
             cleanupOnExit = {
@@ -3171,9 +2874,14 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         rtpDtmfTimestampSamples.set(0)
         Rlog.d(
             TAG,
-            "Encode thread started: codec=${audioCodec.name}/${audioCodec.sampleRate} " +
-                "callId=$callId amrTrack=${call.amrTrack} " +
-                "remote=${call.rtpRemoteAddr}:${call.rtpRemotePort} gen=$generation",
+            SipUplinkEncodeThreadLog.encodeThreadStarted(
+                codecName = audioCodec.name,
+                sampleRate = audioCodec.sampleRate,
+                callId = callId,
+                amrTrack = call.amrTrack,
+                remote = "${call.rtpRemoteAddr}:${call.rtpRemotePort}",
+                generation = generation,
+            ),
         )
         val encoder = SipAudioCodecFactory.createStartedEncoder(
             audioCodec = audioCodec,
@@ -3213,18 +2921,19 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     ) {
         val call = callSnapshot ?: currentCall
         if (call == null) {
-            Rlog.w(TAG, "callEncodeThread: no currentCall; not starting encoder reason=$reason")
+            Rlog.w(TAG, SipUplinkEncodeThreadLog.noCurrentCallLog(reason))
             return
         }
-        val audioCodec = call.audioCodec
-        val callId = call.callIdOrEmpty()
-        val gen = callGeneration.get()
+        val startState = SipUplinkEncodeThreadLog.startState(
+            call = call,
+            generation = callGeneration.get(),
+        )
         thread {
             runUplinkEncodeThread(
                 call = call,
-                callId = callId,
-                audioCodec = audioCodec,
-                generation = gen,
+                callId = startState.callId,
+                audioCodec = startState.audioCodec,
+                generation = startState.generation,
                 incomingMicStartDelayMs = incomingMicStartDelayMs,
                 reason = reason,
             )
@@ -3251,17 +2960,17 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val activeCallId = currentCall?.callIdOrEmpty().orEmpty()
 
         if (activeCallId != callId) {
-            Rlog.d(TAG, "Not notifying outgoing connected for stale call: callId=$callId active=$activeCallId reason=$reason")
+            Rlog.d(TAG, SipOutgoingCallConnectionLogs.staleConnectedNotifyLog(callId, activeCallId, reason))
             return
         }
 
         if (!callStarted.get()) {
-            Rlog.d(TAG, "Outgoing RTP seen before final answer; wait before connected notify callId=$callId reason=$reason")
+            Rlog.d(TAG, SipOutgoingCallConnectionLogs.rtpBeforeFinalAnswerLog(callId, reason))
             return
         }
 
         if (!call.outgoingRtpReceived.get()) {
-            Rlog.d(TAG, "Outgoing final answer received but no post-answer remote RTP yet; keeping Android call in dialing state callId=$callId reason=$reason")
+            Rlog.d(TAG, SipOutgoingCallConnectionLogs.noPostAnswerRtpYetLog(callId, reason))
             return
         }
 
@@ -3279,7 +2988,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             call.outgoingConnectedNotified.set(true)
         }
 
-        Rlog.d(TAG, "Outgoing call connected after remote RTP: callId=$callId reason=$reason")
+        Rlog.d(TAG, SipOutgoingCallConnectionLogs.connectedAfterRemoteRtpLog(callId, reason))
         onOutgoingCallConnected?.invoke(
             Object(),
             mapOf("call-id" to callId, "connectedReason" to reason) +
@@ -3297,115 +3006,52 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 if (activeCall.outgoingConnectedNotified.get() || activeCall.outgoingRtpReceived.get()) return@thread
                 if (!callStarted.get()) return@thread
 
-                Rlog.w(TAG, "No post-answer RTP within ${timeoutMs}ms for outgoing call; terminating no-media dialog as network reject callId=$callId")
+                Rlog.w(TAG, SipOutgoingCallConnectionLogs.postAnswerRtpTimeoutLog(timeoutMs, callId))
                 callId?.let { outgoingConnectedCallIds.remove(it) }
-                stopCallRuntime("post-answer RTP timeout")
+                stopCallRuntime(SipOutgoingCallConnectionLogs.postAnswerRtpTimeoutReason())
                 try {
                     sendByeForCall(activeCall)
                 } catch (t: Throwable) {
-                    Rlog.w(TAG, "Failed to send BYE for outgoing no-media timeout callId=$callId", t)
+                    Rlog.w(TAG, SipOutgoingCallConnectionLogs.failedByeForNoMediaTimeoutLog(callId), t)
                 }
                 currentCall = null
-                clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = "post-answer RTP timeout")
+                clearPendingOutgoingInvite(
+                    callId,
+                    closeRtpSocket = false,
+                    reason = SipOutgoingCallConnectionLogs.postAnswerRtpTimeoutReason(),
+                )
                 onCancelledCall?.invoke(
                     Object(),
                     "",
-                    mapOf(
-                        "call-id" to callId,
-                        "statusCode" to "480",
-                        "statusString" to "No post-answer RTP",
-                        "remoteNoMediaRelease" to "true",
-                    )
+                    SipOutgoingCallConnectionLogs.postAnswerRtpTimeoutCancellationExtras(callId),
                 )
             } catch (t: Throwable) {
-                Rlog.e(TAG, "Outgoing post-answer RTP timeout failed callId=$callId", t)
+                Rlog.e(TAG, SipOutgoingCallConnectionLogs.postAnswerRtpTimeoutFailedLog(callId), t)
             }
         }
     }
 
-    private fun completeIncomingPreconditionAnswerSdp(answerSdp: ByteArray, callId: String): ByteArray {
-        val lines = answerSdp
-            .toString(Charsets.UTF_8)
-            .split("[\r\n]+".toRegex())
-            .filter { it.isNotBlank() }
-
-        val hasPrecondition = lines.any { line ->
-            line.startsWith("a=curr:qos", ignoreCase = true) ||
-                line.startsWith("a=des:qos", ignoreCase = true) ||
-                line.startsWith("a=conf:qos", ignoreCase = true)
-        }
-        if (!hasPrecondition) return answerSdp
-
-        val rewritten = lines.map { line ->
-            when {
-                line.startsWith("a=curr:qos local", ignoreCase = true) -> "a=curr:qos local sendrecv"
-                line.startsWith("a=curr:qos remote", ignoreCase = true) -> "a=curr:qos remote sendrecv"
-                line.startsWith("a=des:qos optional local", ignoreCase = true) -> "a=des:qos mandatory local sendrecv"
-                line.startsWith("a=des:qos optional remote", ignoreCase = true) -> "a=des:qos mandatory remote sendrecv"
-                line.startsWith("a=des:qos mandatory local", ignoreCase = true) -> "a=des:qos mandatory local sendrecv"
-                line.startsWith("a=des:qos mandatory remote", ignoreCase = true) -> "a=des:qos mandatory remote sendrecv"
-                line.startsWith("a=conf:qos remote", ignoreCase = true) -> "a=conf:qos remote sendrecv"
-                line.equals("a=inactive", ignoreCase = true) -> "a=sendrecv"
-                line.equals("a=sendonly", ignoreCase = true) -> "a=sendrecv"
-                line.equals("a=recvonly", ignoreCase = true) -> "a=sendrecv"
-                else -> line
-            }
-        }.let { mapped ->
-            val withConf = if (mapped.any { it.startsWith("a=conf:qos remote", ignoreCase = true) }) {
-                mapped
-            } else {
-                mapped + "a=conf:qos remote sendrecv"
-            }
-            if (withConf.any { it.equals("a=sendrecv", ignoreCase = true) }) {
-                withConf
-            } else {
-                withConf + "a=sendrecv"
-            }
-        }
-
-        if (rewritten != lines) {
-            Rlog.d(TAG, "Completing incoming final 200 OK precondition SDP: callId=$callId")
-        }
-        return (rewritten.joinToString("\r\n") + "\r\n").toByteArray(Charsets.US_ASCII)
-    }
+    private fun completeIncomingPreconditionAnswerSdp(answerSdp: ByteArray, callId: String): ByteArray =
+        SipIncomingInviteFinalSdp.completePreconditionAnswer(
+            logTag = TAG,
+            answerSdp = answerSdp,
+            callId = callId,
+        )
 
 
     private fun okAcceptedIncomingInviteFinalResponse(
         call: Call,
         omitFinalSdp: Boolean,
     ): SipResponse {
-        val myHeaders = call.callHeaders
         val finalBody = if (!omitFinalSdp) call.sdp else ByteArray(0)
-        val finalSdpHeaders = if (!omitFinalSdp) {
-            """
-            Content-Type: application/sdp
-            Content-Length: ${finalBody.size}
-            """.toSipHeadersMap()
-        } else {
-            "Content-Length: 0".toSipHeadersMap()
-        }
-        val myHeaders3 =
-            myHeaders - "rseq" - "security-verify" - "p-access-network-info" - "content-type" - "content-length" +
-                """
-                Session-Expires: 1800;refresher=uas
-                Contact: ${call.callHeaders["contact"]!!.first()}
-                """.toSipHeadersMap() +
-                finalSdpHeaders
-
-        return SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = myHeaders3,
+        return SipIncomingInviteFinalResponses.acceptedFinalResponse(
+            callHeaders = call.callHeaders,
+            contact = call.callHeaders["contact"]!!.first(),
             body = finalBody,
-            autofill = false
+            omitFinalSdp = omitFinalSdp,
         )
     }
 
-
-    private data class IncomingInviteFinalResponseWrite(
-        val responseWriter: OutputStream,
-        val responseBytes: ByteArray,
-    )
 
     private fun sendAcceptedIncomingInviteFinalResponse(
         call: Call,
@@ -3414,14 +3060,30 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     ): IncomingInviteFinalResponseWrite? {
         val responseWriter = call.incomingResponseWriter ?: socket.gWriter()
         val responseBytes = response.toByteArray()
-        Rlog.d(TAG, "Sending $response via incomingResponseWriter=${call.incomingResponseWriter != null}")
+        Rlog.d(
+            TAG,
+            SipIncomingInviteFinalResponses.acceptedFinalResponseWriteLog(
+                response = response,
+                hasIncomingResponseWriter = call.incomingResponseWriter != null,
+            ),
+        )
         incomingFinalResponseSent.set(true)
         incomingAcceptedAwaitingAck.set(true)
-        if (!writeSipBytes(responseWriter, responseBytes, "incoming INVITE final 200 OK callId=$acceptedCallId")) {
+        if (
+            !writeSipBytes(
+                responseWriter,
+                responseBytes,
+                SipIncomingInviteFinalResponses.acceptedFinalResponseWriteContext(acceptedCallId),
+            )
+        ) {
             incomingFinalResponseSent.set(false)
             incomingAcceptedAwaitingAck.set(false)
             incomingHangupAfterAck.set(false)
-            onCancelledCall?.invoke(Object(), "", mapOf("call-id" to acceptedCallId))
+            onCancelledCall?.invoke(
+                Object(),
+                "",
+                SipIncomingInviteFinalResponses.acceptedFinalResponseWriteFailureCancellationExtras(acceptedCallId),
+            )
             return null
         }
         incomingFinalResponseSent.set(true)
@@ -3435,16 +3097,23 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
 
     private fun prewarmIncomingMediaAfterAccept(call: Call) {
-        if (threadsStarted.compareAndSet(false, true)) {
-            Rlog.d(TAG, "Prewarming incoming media threads after final 200 OK while waiting for ACK; delaying mic open after ACK")
-            callDecodeThread()
-            callEncodeThread(
-                incomingMicStartDelayMs = 250L,
-                reason = "incoming ACK audio route settle",
-                callSnapshot = call,
+        when (
+            val action = SipIncomingInviteFinalResponses.mediaPrewarmAction(
+                startedNow = threadsStarted.compareAndSet(false, true),
             )
-        } else {
-            Rlog.d(TAG, "Incoming media threads already started while accepting call")
+        ) {
+            IncomingAcceptMediaPrewarmAction.START -> {
+                Rlog.d(TAG, SipIncomingInviteFinalResponses.mediaPrewarmLogMessage(action))
+                callDecodeThread()
+                callEncodeThread(
+                    incomingMicStartDelayMs = 250L,
+                    reason = SipIncomingInviteFinalResponses.incomingAckAudioRouteSettleReason(),
+                    callSnapshot = call,
+                )
+            }
+            IncomingAcceptMediaPrewarmAction.ALREADY_STARTED -> {
+                Rlog.d(TAG, SipIncomingInviteFinalResponses.mediaPrewarmLogMessage(action))
+            }
         }
     }
 
@@ -3459,34 +3128,71 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         // diagnostic: if the first 200 OK is lost/ignored on the IMS TCP flow, repeated
         // 200 OKs should make the missing-ACK problem visible in the log/network trace.
         thread(name = "PhhIncoming2xxRetransmit") {
-            var delayMs = 500L
+            var delayMs = SipIncomingInviteFinalResponses.initialFinalResponseRetransmitDelayMs()
             var elapsedMs = 0L
-            while (incomingAcceptedAwaitingAck.get() && elapsedMs < 32000L) {
+            while (
+                incomingAcceptedAwaitingAck.get() &&
+                    elapsedMs < SipIncomingInviteFinalResponses.maxFinalResponseRetransmitElapsedMs()
+            ) {
                 Thread.sleep(delayMs)
                 elapsedMs += delayMs
                 val stillSameCall = currentCall?.callIdOrNull() == acceptedCallId
                 if (!incomingAcceptedAwaitingAck.get() || !stillSameCall) break
-                Rlog.w(TAG, "Retransmitting incoming 200 OK waiting for ACK callId=$acceptedCallId elapsed=${elapsedMs}ms")
+                Rlog.w(
+                    TAG,
+                    SipIncomingInviteFinalResponses.finalResponseRetransmitLog(
+                        acceptedCallId = acceptedCallId,
+                        elapsedMs = elapsedMs,
+                    ),
+                )
                 val retransmitWriter =
                     currentCall?.takeIf { it.callIdOrNull() == acceptedCallId }?.incomingResponseWriter
                         ?: responseWriter
-                if (!writeSipBytes(retransmitWriter, responseBytes, "incoming INVITE final 200 OK retransmit callId=$acceptedCallId elapsed=${elapsedMs}ms")) {
-                    Rlog.w(TAG, "Stopping incoming 200 OK retransmit after write failure callId=$acceptedCallId elapsed=${elapsedMs}ms")
+                if (
+                    !writeSipBytes(
+                        retransmitWriter,
+                        responseBytes,
+                        SipIncomingInviteFinalResponses.finalResponseRetransmitWriteContext(
+                            acceptedCallId = acceptedCallId,
+                            elapsedMs = elapsedMs,
+                        ),
+                    )
+                ) {
+                    Rlog.w(
+                        TAG,
+                        SipIncomingInviteFinalResponses.finalResponseRetransmitWriteFailureLog(
+                            acceptedCallId = acceptedCallId,
+                            elapsedMs = elapsedMs,
+                        ),
+                    )
                     incomingAcceptedAwaitingAck.set(false)
                     incomingHangupAfterAck.set(false)
                     break
                 }
-                delayMs = (delayMs * 2).coerceAtMost(4000L)
+                delayMs = SipIncomingInviteFinalResponses.nextFinalResponseRetransmitDelayMs(delayMs)
             }
             if (incomingAcceptedAwaitingAck.get()) {
-                Rlog.w(TAG, "Incoming accepted call still has no ACK after ${elapsedMs}ms; clearing pending accepted state callId=$acceptedCallId")
+                Rlog.w(
+                    TAG,
+                    SipIncomingInviteFinalResponses.finalResponseMissingAckTimeoutLog(
+                        acceptedCallId = acceptedCallId,
+                        elapsedMs = elapsedMs,
+                    ),
+                )
                 incomingAcceptedAwaitingAck.set(false)
                 incomingHangupAfterAck.set(false)
                 if (currentCall?.callIdOrNull() == acceptedCallId && !callStarted.get()) {
-                    stopCallRuntime("call cleanup")
-                    rememberTerminatedIncomingCall(acceptedCallId, "incoming ACK timeout")
+                    stopCallRuntime(SipIncomingInviteFinalResponses.finalResponseMissingAckStopReason())
+                    rememberTerminatedIncomingCall(
+                        acceptedCallId,
+                        SipIncomingInviteFinalResponses.finalResponseMissingAckTerminationReason(),
+                    )
                     currentCall = null
-                    onCancelledCall?.invoke(Object(), "", mapOf("call-id" to acceptedCallId))
+                    onCancelledCall?.invoke(
+                        Object(),
+                        "",
+                        SipIncomingInviteFinalResponses.finalResponseMissingAckCancellationExtras(acceptedCallId),
+                    )
                 }
             }
         }
@@ -3502,7 +3208,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         call: Call,
         acceptedCallId: String,
     ): AcceptedIncomingInviteFinalSdp {
-        val omitFinalSdp = call.hasEarlyMedia
+        val omitFinalSdp = SipIncomingInviteFinalResponses.shouldOmitFinalSdp(call.hasEarlyMedia)
         var acceptedCall = call
         if (!omitFinalSdp) {
             val finalIncomingSdp = completeIncomingPreconditionAnswerSdp(acceptedCall.sdp, acceptedCallId)
@@ -3511,11 +3217,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 currentCall = acceptedCall
             }
         } else {
-            Rlog.d(
-                TAG,
-                "Omitting SDP from final incoming 200 OK because reliable provisional/UPDATE offer-answer already completed " +
-                    "callId=$acceptedCallId",
-            )
+            Rlog.d(TAG, SipIncomingInviteFinalResponses.omitFinalSdpLogMessage(acceptedCallId))
         }
 
         return AcceptedIncomingInviteFinalSdp(
@@ -3533,7 +3235,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     private fun acceptedIncomingCallAfterAccessGuard(): IncomingAcceptTarget? {
         var call = currentCall
         if (call == null || call.outgoing) {
-            Rlog.w(TAG, "acceptCall without valid incoming currentCall: $call")
+            Rlog.w(TAG, SipIncomingInviteFinalResponses.acceptWithoutValidIncomingCallLog(call))
             return null
         }
 
@@ -3546,8 +3248,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         if (call == null || call.outgoing || call.callIdOrEmpty() != acceptedCallId) {
             Rlog.w(
                 TAG,
-                "acceptCall aborted after IMS access guard because current call changed: " +
-                    "acceptedCallId=$acceptedCallId current=${call?.callIdOrEmpty()} outgoing=${call?.outgoing}",
+                SipIncomingInviteFinalResponses.acceptAbortedAfterAccessGuardLog(
+                    acceptedCallId = acceptedCallId,
+                    currentCallId = call?.callIdOrEmpty(),
+                    outgoing = call?.outgoing,
+                ),
             )
             return null
         }
@@ -3632,35 +3337,35 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         thread {
             val call = currentCall
             if (call == null || call.outgoing) {
-                Rlog.w(TAG, "rejectCall without valid incoming currentCall: $call")
+                Rlog.w(TAG, SipIncomingInviteFinalResponses.rejectWithoutValidIncomingCallLog(call))
                 return@thread
             }
             val rejectedCallId = call.callIdOrEmpty()
-            rememberTerminatedIncomingCall(rejectedCallId, "local reject")
-            val myHeaders = call.callHeaders - "rseq" - "require" - "content-type" - "p-access-network-info" +
-                "Content-Length: 0".toSipHeadersMap()
-            val msg =
-                SipResponse(
-                    statusCode = 603,
-                    statusString = "Decline",
-                    headersParam = myHeaders,
-                    autofill = false
-                )
+            rememberTerminatedIncomingCall(
+                rejectedCallId,
+                SipIncomingInviteFinalResponses.localRejectTerminationReason(),
+            )
+            val msg = SipIncomingInviteFinalResponses.localRejectResponse(call.callHeaders)
             val responseWriter = call.incomingResponseWriter ?: dispatcher.writerForCallId(rejectedCallId) ?: socket.gWriter()
-            Rlog.d(TAG, "Sending $msg via incomingResponseWriter=${call.incomingResponseWriter != null}")
+            Rlog.d(
+                TAG,
+                SipIncomingInviteFinalResponses.localRejectWriteLog(
+                    response = msg,
+                    hasIncomingResponseWriter = call.incomingResponseWriter != null,
+                ),
+            )
             writeSipBytesWithFlush(responseWriter, "SipHandler msg", msg.toByteArray())
 
-            stopCallRuntime("call cleanup")
+            stopCallRuntime(SipIncomingInviteFinalResponses.localRejectCleanupReason())
             incomingFinalResponseSent.set(false)
             incomingAcceptedAwaitingAck.set(false)
             incomingHangupAfterAck.set(false)
             currentCall = null
-            onCancelledCall?.invoke(Object(), "", mapOf(
-                "call-id" to rejectedCallId,
-                "statusCode" to "603",
-                "statusString" to "Decline",
-                "localReject" to "true",
-            ))
+            onCancelledCall?.invoke(
+                Object(),
+                "",
+                SipIncomingInviteFinalResponses.localRejectCancellationExtras(rejectedCallId),
+            )
         }
     }
 
@@ -3680,51 +3385,46 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val pending = pendingOutgoingInvite ?: return
         if (callId != null && pending.callId != callId) return
 
-        Rlog.d(TAG, "Clearing pending outgoing INVITE callId=${pending.callId} closeRtpSocket=$closeRtpSocket reason=$reason")
+        Rlog.d(
+            TAG,
+            SipRemoteDialogTermination.clearingPendingOutgoingInviteLog(
+                callId = pending.callId,
+                closeRtpSocket = closeRtpSocket,
+                reason = reason,
+            ),
+        )
         pendingOutgoingInvite = null
         if (closeRtpSocket && currentCall?.rtpSocket !== pending.rtpSocket) {
             try {
                 pending.rtpSocket.close()
             } catch (t: Throwable) {
-                Rlog.d(TAG, "Closing pending outgoing RTP socket failed", t)
+                Rlog.d(TAG, SipRemoteDialogTermination.closingPendingOutgoingRtpSocketFailedLog(), t)
             }
         }
     }
 
     private fun sendCancelForPendingOutgoingInvite(pending: PendingOutgoingInvite, reason: String): Boolean {
         if (!pending.cancelSent.compareAndSet(false, true)) {
-            Rlog.d(TAG, "CANCEL already sent for pending outgoing INVITE callId=${pending.callId} reason=$reason")
+            Rlog.d(TAG, SipRemoteDialogTermination.pendingCancelAlreadySentLog(pending.callId, reason))
             return false
         }
 
-        val inviteCseqNumber = pending.headers["cseq"]?.getOrNull(0)?.substringBefore(" ") ?: "1"
-        val cancellableHeaders = pending.headers.filter { (k, _) ->
-            k in setOf(
-                "via",
-                "route",
-                "from",
-                "to",
-                "call-id",
-                "max-forwards",
-                "user-agent",
-                "p-access-network-info",
-                "security-verify",
-                "require",
-                "proxy-require",
-            )
-        }
-        val cancelHeaders = cancellableHeaders - "cseq" - "content-length" - "content-type" +
-            """
-            CSeq: $inviteCseqNumber CANCEL
-            Content-Length: 0
-            """.toSipHeadersMap()
-        val cancel = SipRequest(
-            SipMethod.CANCEL,
-            pending.destination,
-            headersParam = cancelHeaders,
+        val inviteCseqNumber = SipRemoteDialogTermination.inviteCseqNumber(pending.headers)
+        val cancellableHeaders = SipRemoteDialogTermination.cancellableCancelHeaders(pending.headers)
+        val cancelHeaders = SipRemoteDialogTermination.cancelHeaders(
+            cancellableHeaders = cancellableHeaders,
+            inviteCseqNumber = inviteCseqNumber,
         )
-        Rlog.d(TAG, "Sending CANCEL for pending outgoing INVITE callId=${pending.callId} reason=$reason $cancel")
-        writeSipBytesWithFlush(socket.gWriter(), "SipHandler cancel", cancel.toByteArray())
+        val cancel = SipRemoteDialogTermination.cancelRequest(
+            destination = pending.destination,
+            cancelHeaders = cancelHeaders,
+        )
+        Rlog.d(TAG, SipRemoteDialogTermination.pendingCancelSendLog(pending.callId, reason, cancel))
+        writeSipBytesWithFlush(
+            socket.gWriter(),
+            SipRemoteDialogTermination.pendingCancelWriteLabel(),
+            cancel.toByteArray(),
+        )
 
         /*
          * Clear stale pending outgoing INVITE immediately after local CANCEL.
@@ -3736,20 +3436,23 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         clearPendingOutgoingInvite(
             callId = pending.callId,
             closeRtpSocket = true,
-            reason = "local CANCEL sent: $reason",
+            reason = SipRemoteDialogTermination.localCancelSentReason(reason),
         )
         return true
     }
 
     private fun sendByeForCall(call: Call) {
         val byeHeaders = localDialogHeadersForRequest(call, SipMethod.BYE)
-        val bye = SipRequest(
-            SipMethod.BYE,
-            call.remoteContact,
-            headersParam = byeHeaders
+        val bye = SipRemoteDialogTermination.byeRequest(
+            remoteContact = call.remoteContact,
+            byeHeaders = byeHeaders,
         )
-        Rlog.d(TAG, "Sending BYE $bye")
-        writeSipBytesWithFlush(socket.gWriter(), "SipHandler bye", bye.toByteArray())
+        Rlog.d(TAG, SipRemoteDialogTermination.byeLog(bye))
+        writeSipBytesWithFlush(
+            socket.gWriter(),
+            SipRemoteDialogTermination.byeWriteLabel(),
+            bye.toByteArray(),
+        )
     }
 
     fun terminateCall() {
@@ -3758,14 +3461,21 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         if (call == null) {
             if (pendingOutgoing != null) {
-                Rlog.w(TAG, "Local hangup while outgoing INVITE is still pending; sending CANCEL callId=${pendingOutgoing.callId}")
-                stopCallRuntime("local terminate")
-                sendCancelForPendingOutgoingInvite(pendingOutgoing, "local hangup before dialog")
-                onCancelledCall?.invoke(Object(), "", mapOf("call-id" to pendingOutgoing.callId))
+                Rlog.w(TAG, SipRemoteDialogTermination.pendingOutgoingHangupLog(pendingOutgoing.callId))
+                stopCallRuntime(SipRemoteDialogTermination.localTerminateReason())
+                sendCancelForPendingOutgoingInvite(
+                    pendingOutgoing,
+                    SipRemoteDialogTermination.localHangupBeforeDialogReason(),
+                )
+                onCancelledCall?.invoke(
+                    Object(),
+                    "",
+                    SipRemoteDialogTermination.localCancelExtras(pendingOutgoing.callId),
+                )
                 return
             }
 
-            Rlog.w(TAG, "terminateCall without currentCall or pending outgoing INVITE")
+            Rlog.w(TAG, SipRemoteDialogTermination.terminateWithoutCallLog())
             return
         }
 
@@ -3773,44 +3483,66 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         if (call.outgoing && !callStarted.get()) {
             if (pendingOutgoing != null && pendingOutgoing.callId == call.callIdOrNull()) {
-                Rlog.w(TAG, "Local hangup before outgoing INVITE final answer; sending CANCEL callId=${pendingOutgoing.callId}")
-                sendCancelForPendingOutgoingInvite(pendingOutgoing, "local hangup before final INVITE answer")
+                Rlog.w(TAG, SipRemoteDialogTermination.localHangupBeforeFinalAnswerLog(pendingOutgoing.callId))
+                sendCancelForPendingOutgoingInvite(
+                    pendingOutgoing,
+                    SipRemoteDialogTermination.localHangupBeforeFinalAnswerReason(),
+                )
                 currentCall = null
-                onCancelledCall?.invoke(Object(), "", mapOf("call-id" to pendingOutgoing.callId))
+                onCancelledCall?.invoke(
+                    Object(),
+                    "",
+                    SipRemoteDialogTermination.localCancelExtras(pendingOutgoing.callId),
+                )
                 return
             }
-            Rlog.w(TAG, "Outgoing call not confirmed yet but no pending INVITE exists; falling back to BYE")
+            Rlog.w(TAG, SipRemoteDialogTermination.outgoingUnconfirmedNoPendingInviteLog())
         }
 
         if (!call.outgoing && incomingFinalResponseSent.get() && !callStarted.get()) {
-            Rlog.w(TAG, "Local hangup before incoming ACK; deferring BYE until ACK and keeping 200 OK retransmission active")
+            Rlog.w(TAG, SipRemoteDialogTermination.incomingPreAckHangupLog())
             incomingHangupAfterAck.set(true)
-            Rlog.d(TAG, "Keeping accepted pre-ACK incoming Call-ID live for final 200 OK retransmits")
-            onCancelledCall?.invoke(Object(), "", emptyMap())
+            Rlog.d(TAG, SipRemoteDialogTermination.incomingPreAckKeepaliveLog())
+            onCancelledCall?.invoke(
+            Object(),
+            "",
+            SipRemoteDialogTermination.localHangupCancellationExtras(),
+        )
             return
         }
 
         sendByeForCall(call)
         if (!call.outgoing) {
-            rememberTerminatedIncomingCall(call.callIdOrEmpty(), "local BYE")
+            rememberTerminatedIncomingCall(
+                call.callIdOrEmpty(),
+                SipRemoteDialogTermination.localByeTerminationReason(),
+            )
             currentCall = null
         } else {
             val outgoingByeCallId = call.callIdOrNull()
-            Rlog.d(TAG, "Keeping outgoing dialog until BYE transaction completes callId=$outgoingByeCallId")
+            Rlog.d(TAG, SipRemoteDialogTermination.outgoingByeWaitLog(outgoingByeCallId))
             myHandler.postDelayed({
                 if (currentCall?.outgoing == true &&
                     currentCall?.callIdOrNull() == outgoingByeCallId &&
                     callStopped.get()
                 ) {
-                    Rlog.w(TAG, "Clearing outgoing dialog after BYE response timeout callId=$outgoingByeCallId")
+                    Rlog.w(TAG, SipRemoteDialogTermination.outgoingByeTimeoutLog(outgoingByeCallId))
                     currentCall = null
                 }
             }, 4000L)
         }
         incomingAcceptedAwaitingAck.set(false)
         incomingHangupAfterAck.set(false)
-        clearPendingOutgoingInvite(call.callIdOrNull(), closeRtpSocket = false, reason = "confirmed call terminated")
-        onCancelledCall?.invoke(Object(), "", emptyMap())
+        clearPendingOutgoingInvite(
+            call.callIdOrNull(),
+            closeRtpSocket = false,
+            reason = SipRemoteDialogTermination.confirmedCallTerminatedReason(),
+        )
+        onCancelledCall?.invoke(
+            Object(),
+            "",
+            SipRemoteDialogTermination.localHangupCancellationExtras(),
+        )
     }
 
     /*
@@ -3904,32 +3636,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         return "sip:$e164@ims.singtel.com"
     }
 
-    private fun normalizeSingTelStockOutgoingSdpLine(line: String): String {
-        val wbRtpmap = if (
-            line.startsWith("a=rtpmap:", ignoreCase = true) &&
-                line.contains("AMR-WB/16000/1", ignoreCase = true)
-        ) {
-            line.replace("AMR-WB/16000/1", "AMR-WB/16000")
-        } else {
-            line
-        }
-
-        val normalizedFmtp = Regex(
-            "^a=fmtp:(\\d+)\\s+.*mode-change-capability=2.*$",
-            RegexOption.IGNORE_CASE,
-        ).matchEntire(wbRtpmap)?.let { match ->
-            "a=fmtp:${match.groupValues[1]} max-red=0; mode-change-capability=2; octet-align=0"
-        } ?: wbRtpmap
-
-        return if (normalizedFmtp.equals("a=maxptime:240", ignoreCase = true)) {
-            "a=maxptime:40"
-        } else {
-            normalizedFmtp
-        }
-    }
-
-
-
     private fun createOutgoingCallRtpSocket(): DatagramSocket? {
         val rtpSocket = try {
             DatagramSocket(0, localAddr)
@@ -3963,397 +3669,52 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     }
 
 
-    private data class OutgoingInviteSdpOffer(
-        val amrNbTrack: Int,
-        val dtmfNbTrack: Int,
-        val sdp: ByteArray,
-        val inviteBody: ByteArray,
-    )
-
-
-    private data class OutgoingInviteSdpMediaOffer(
-        val amrNbTrack: Int,
-        val amrWbTrack: Int,
-        val dtmfNbTrack: Int,
-        val dtmfWbTrack: Int,
-        val offerAmrWb: Boolean,
-        val allTracks: List<Int>,
-        val offerBandwidthAs: Int,
-    )
-
-    private fun buildOutgoingInviteSdpMediaOffer(): OutgoingInviteSdpMediaOffer {
-        val amrNbTrack = 97
-        val amrWbTrack = 98
-        val dtmfNbTrack = 100
-        val dtmfWbTrack = 101
-        val offerAmrWb = amrWbMediaCodecAvailable
-        val allTracks = if (offerAmrWb) {
-            listOf(amrWbTrack, amrNbTrack, dtmfWbTrack, dtmfNbTrack)
-        } else {
-            listOf(amrNbTrack, dtmfNbTrack)
-        }
-        val offerBandwidthAs = if (offerAmrWb) {
-            SipAudioCodecNegotiator.sdpBandwidthAsKbps(SipAudioCodecs.AMR_WB)
-        } else {
-            SipAudioCodecNegotiator.sdpBandwidthAsKbps(SipAudioCodecs.AMR_NB)
-        }
-        Rlog.d(
-            TAG,
-            "Outgoing INVITE codec offer: offerAmrWb=$offerAmrWb " +
-                "tracks=$allTracks bandwidthAs=$offerBandwidthAs",
-        )
-
-        return OutgoingInviteSdpMediaOffer(
-            amrNbTrack = amrNbTrack,
-            amrWbTrack = amrWbTrack,
-            dtmfNbTrack = dtmfNbTrack,
-            dtmfWbTrack = dtmfWbTrack,
-            offerAmrWb = offerAmrWb,
-            allTracks = allTracks,
-            offerBandwidthAs = offerBandwidthAs,
-        )
-    }
-
-
-    private fun buildGenericOutgoingInviteSdpBody(
-        rtpSocket: DatagramSocket,
-        mediaOffer: OutgoingInviteSdpMediaOffer,
-        ipType: String,
-    ): ByteArray {
-        val amrNbTrack = mediaOffer.amrNbTrack
-        val amrWbTrack = mediaOffer.amrWbTrack
-        val dtmfNbTrack = mediaOffer.dtmfNbTrack
-        val dtmfWbTrack = mediaOffer.dtmfWbTrack
-        val offerAmrWb = mediaOffer.offerAmrWb
-        val allTracks = mediaOffer.allTracks
-        val offerBandwidthAs = mediaOffer.offerBandwidthAs
-
-        val sdpLines = mutableListOf(
-           "v=0",
-           "o=- 1 2 IN $ipType ${socket.gLocalAddr().hostAddress}",
-           "s=phh voice call",
-           "c=IN $ipType ${socket.gLocalAddr().hostAddress}",
-           "b=AS:$offerBandwidthAs",
-           "b=RS:0",
-           "b=RR:0",
-           "t=0 0",
-           "m=audio ${rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}",
-           "b=AS:$offerBandwidthAs",
-           "b=RS:0",
-           "b=RR:0",
-           "a=ptime:20",
-           "a=maxptime:240",
-       )
-       if (offerAmrWb) {
-           sdpLines += listOf(
-               "a=rtpmap:$amrWbTrack AMR-WB/16000",
-               "a=fmtp:$amrWbTrack octet-align=0;mode-change-capability=2;max-red=0",
-               "a=rtpmap:$dtmfWbTrack telephone-event/16000",
-               "a=fmtp:$dtmfWbTrack 0-15",
-           )
-       }
-       sdpLines += listOf(
-           "a=rtpmap:$amrNbTrack AMR/8000/1",
-           "a=fmtp:$amrNbTrack mode-change-capability=2;octet-align=0;max-red=0",
-           "a=rtpmap:$dtmfNbTrack telephone-event/8000",
-           "a=fmtp:$dtmfNbTrack 0-15",
-           "a=curr:qos local none",
-           "a=curr:qos remote none",
-           "a=des:qos optional local sendrecv",
-           "a=des:qos optional remote sendrecv",
-           "a=sendrecv",
-       )
-       /*
-        * Some IMS SBCs are strict about SDP body framing and expect the
-        * outgoing INVITE SDP body to end with a final CRLF after the last
-        * SDP line, not only CRLF between lines.
-        */
-       val finalOutgoingSdpLines = if (isSingTelStockOutgoingCarrier()) {
-           sdpLines.map { line -> normalizeSingTelStockOutgoingSdpLine(line) }
-       } else {
-           sdpLines
-       }
-       return (finalOutgoingSdpLines.joinToString("\r\n") + "\r\n").toByteArray(Charsets.US_ASCII)
-    }
-
-
-    private fun buildSingTelCompactOutgoingInviteSdpBody(
-        rtpSocket: DatagramSocket,
-        mediaOffer: OutgoingInviteSdpMediaOffer,
-        ipType: String,
-    ): ByteArray {
-        val amrNbTrack = mediaOffer.amrNbTrack
-        /*
-         * Keep the initial SingTel SDP offer compact enough to stay below the
-         * carrier path's practical protected-request size limit. The normal
-         * multi-codec/precondition offer is valid SIP/SDP, but is too large
-         * for this path and gets dropped before any SIP response.
-         */
-        return listOf(
-            "v=0",
-            "o=- 1 2 IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "s=-",
-            "c=IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "t=0 0",
-            "m=audio ${rtpSocket.localPort} RTP/AVP $amrNbTrack",
-            "a=rtpmap:$amrNbTrack AMR/8000",
-            "a=fmtp:$amrNbTrack octet-align=0",
-            "a=ptime:20",
-            "a=sendrecv",
-        ).joinToString("\r\n")
-            .plus("\r\n")
-            .toByteArray(Charsets.US_ASCII)
-    }
-
-
-    private fun buildOutgoingInviteSdpOfferResult(
-        mediaOffer: OutgoingInviteSdpMediaOffer,
-        genericSdp: ByteArray,
-        singtelCompactSdp: ByteArray,
-    ): OutgoingInviteSdpOffer {
-        /*
-         * SingTel requires a compact originating request. Use public SIP URI
-         * addressing and a compact initial SDP offer below instead of the
-         * generic TEL-URI/full-offer shape.
-         */
-        val outgoingInviteBody = if (isSingTelStockOutgoingCarrier()) {
-            singtelCompactSdp
-        } else {
-            genericSdp
-        }
-
-        return OutgoingInviteSdpOffer(
-            amrNbTrack = mediaOffer.amrNbTrack,
-            dtmfNbTrack = mediaOffer.dtmfNbTrack,
-            sdp = genericSdp,
-            inviteBody = outgoingInviteBody,
-        )
-    }
-
     private fun buildOutgoingInviteSdpOffer(
         rtpSocket: DatagramSocket,
     ): OutgoingInviteSdpOffer {
-        val outgoingInviteSdpMediaOffer = buildOutgoingInviteSdpMediaOffer()
-        val ipType = if(localAddr is Inet6Address) "IP6" else "IP4"
-        val sdp = buildGenericOutgoingInviteSdpBody(
+        return SipOutgoingInviteSdp.build(
+            logTag = TAG,
             rtpSocket = rtpSocket,
-            mediaOffer = outgoingInviteSdpMediaOffer,
-            ipType = ipType,
-        )
-        val singtelCompactInitialSdp = buildSingTelCompactOutgoingInviteSdpBody(
-            rtpSocket = rtpSocket,
-            mediaOffer = outgoingInviteSdpMediaOffer,
-            ipType = ipType,
-        )
-        return buildOutgoingInviteSdpOfferResult(
-            mediaOffer = outgoingInviteSdpMediaOffer,
-            genericSdp = sdp,
-            singtelCompactSdp = singtelCompactInitialSdp,
+            localHost = "${socket.gLocalAddr().hostAddress}",
+            ipType = if (localAddr is Inet6Address) "IP6" else "IP4",
+            amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
+            singtelStockOutgoingCarrier = isSingTelStockOutgoingCarrier(),
         )
     }
 
-
-
-    private data class OutgoingInviteRequestContext(
-        val request: SipRequest,
-        val baseHeaders: Map<String, List<String>>,
-        val targetUri: String,
-        val telUri: String,
-        val normalizedPhoneNumber: String,
-    )
-
-
-    private data class OutgoingInviteBaseRequestContext(
-        val normalizedPhoneNumber: String,
-        val telUri: String,
-        val sipInstance: String,
-        val localEndpoint: String,
-        val transport: String,
-        val baseHeaders: Map<String, List<String>>,
-    )
-
-    private fun buildOutgoingInviteBaseRequestContext(
-        phoneNumber: String,
-    ): OutgoingInviteBaseRequestContext {
-        val normalizedPhoneNumber = normalizeOutgoingDialTargetForTelUri(phoneNumber)
-        val to = if (normalizedPhoneNumber.startsWith("+")) {
-            // Global TEL URIs must stand on their own. Adding phone-context to +E.164
-            // numbers makes some IMS cores drop the INVITE without any SIP response.
-            "tel:$normalizedPhoneNumber"
-        } else {
-            "tel:$normalizedPhoneNumber;phone-context=ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
-        }
-        Rlog.d(TAG, "Outgoing dial target raw=$phoneNumber normalized=$normalizedPhoneNumber uri=$to")
-        val sipInstance = "<urn:gsma:imei:${imei.substring(0, 8)}-${imei.substring(8, 14)}-0>"
-        val local =
-            if(socket.gLocalAddr() is Inet6Address)
-                "[${socket.gLocalAddr().hostAddress}]:${serverSocket.localPort}"
-            else
-                "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
-        val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
-        val contactTel =
-            """<sip:$myTel@$local;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
-        val outgoingInviteSessionTimer = inviteSessionTimerPolicy.currentForRealm(realm)
-        val myHeaders = commonHeaders +
-            """
-                From: <$mySip>
-                To: <$to>
-                P-Preferred-Identity: <$mySip>
-                P-Asserted-Identity: <$mySip>
-                Expires: 7200
-                Require: sec-agree
-                Proxy-Require: sec-agree
-                Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS
-                P-Early-Media: supported
-                Content-Type: application/sdp
-                Session-Expires: ${outgoingInviteSessionTimer.sessionExpiresSeconds}
-                Supported: 100rel, replaces, timer, precondition
-                Accept: application/sdp
-                Min-SE: ${outgoingInviteSessionTimer.minSeSeconds}
-                Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
-                P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-                Contact: $contactTel
-                """.toSipHeadersMap() + generateCallId() - "p-asserted-identity"
-        // P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-        // Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
-
-        return OutgoingInviteBaseRequestContext(
-            normalizedPhoneNumber = normalizedPhoneNumber,
-            telUri = to,
-            sipInstance = sipInstance,
-            localEndpoint = local,
-            transport = transport,
-            baseHeaders = myHeaders,
-        )
-    }
-
-
-    private data class OutgoingInviteCarrierRequestShape(
-        val targetUri: String,
-        val headers: Map<String, List<String>>,
-    )
-
-    private fun buildOutgoingInviteCarrierRequestShape(
-        normalizedPhoneNumber: String,
-        telUri: String,
-        baseHeaders: Map<String, List<String>>,
-        sipInstance: String,
-        localEndpoint: String,
-        transport: String,
-    ): OutgoingInviteCarrierRequestShape {
-        val singtelStockOutgoingTargetUri = if (isSingTelStockOutgoingCarrier()) {
-            singtelPublicSipUri(normalizedPhoneNumber)
-        } else {
-            telUri
-        }
-
-        val singtelStockOutgoingHeaders = if (isSingTelStockOutgoingCarrier()) {
-            val singtelStockIdentity = singtelPublicSipUri(myTel)
-            val singtelStockFromTag = baseHeaders["from"]?.firstOrNull()
-                ?.substringAfter(";tag=", missingDelimiterValue = "")
-                ?.substringBefore(";")
-                ?.takeIf { it.isNotBlank() }
-                ?: "phh${System.currentTimeMillis().toString(16)}"
-            val singtelStockContact = "<sip:$imsi@$localEndpoint;transport=$transport>;expires=7200;" +
-                "+sip.instance=\"$sipInstance\";audio;+g.3gpp.accesstype=\"cellular\";" +
-                "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";+g.3gpp.smsip"
-            val singtelCompactContact = "<sip:$imsi@$localEndpoint;transport=$transport>"
-            val singtelStockPaniValue = commonHeaders.entries
-                .firstOrNull { it.key.equals("p-access-network-info", ignoreCase = true) }
-                ?.value
-                ?.firstOrNull()
-                ?: "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=5250102C6B611D01"
-
-            val singtelStockBaseHeaders = baseHeaders.filterKeys { key ->
-                key.equals("via", ignoreCase = true) ||
-                    key.equals("max-forwards", ignoreCase = true) ||
-                    key.equals("user-agent", ignoreCase = true) ||
-                    key.equals("route", ignoreCase = true) ||
-                    key.equals("call-id", ignoreCase = true) ||
-                    key.equals("security-verify", ignoreCase = true) ||
-                    key.equals("proxy-require", ignoreCase = true)
-            }
-
-            // Direct stock-like SingTel INVITE: whitelist only the dynamic dialog and
-            // security headers, then add the originating MMTEL shape explicitly. Do not
-            // carry the generic TEL-URI identity headers from main.
-            /*
-             * Keep the originating SingTel header set intentionally small.
-             * Security-Verify and Content-Type are required/accepted, but
-             * optional identity/access/capability headers make the first
-             * protected INVITE large enough to be dropped by this IMS path.
-             */
-            singtelStockBaseHeaders + """
-                From: <$singtelStockIdentity>;tag=$singtelStockFromTag
-                To: <$singtelStockOutgoingTargetUri>
-                Contact: $singtelCompactContact
-                P-Preferred-Identity: <$singtelStockIdentity>
-                Expires: 7200
-                Require: sec-agree
-                Proxy-Require: sec-agree
-                Content-Type: application/sdp
-                Allow: INVITE, ACK, CANCEL, BYE, OPTIONS
-                Supported: sec-agree
-                Request-Disposition: no-fork
-                P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-                CSeq: 1 INVITE
-            """.toSipHeadersMap()
-        } else {
-            baseHeaders
-        }
-
-        return OutgoingInviteCarrierRequestShape(
-            targetUri = singtelStockOutgoingTargetUri,
-            headers = singtelStockOutgoingHeaders,
-        )
-    }
-
-
-    private fun buildOutgoingInviteRequestContext(
-        outgoingInviteBody: ByteArray,
-        baseRequestContext: OutgoingInviteBaseRequestContext,
-        carrierRequestShape: OutgoingInviteCarrierRequestShape,
-    ): OutgoingInviteRequestContext {
-        val msg =
-            SipRequest(
-                SipMethod.INVITE,
-                carrierRequestShape.targetUri,
-                carrierRequestShape.headers,
-                outgoingInviteBody
-            )
-
-        return OutgoingInviteRequestContext(
-            request = msg,
-            baseHeaders = baseRequestContext.baseHeaders,
-            targetUri = carrierRequestShape.targetUri,
-            telUri = baseRequestContext.telUri,
-            normalizedPhoneNumber = baseRequestContext.normalizedPhoneNumber,
-        )
-    }
 
     private fun buildOutgoingInviteRequest(
         phoneNumber: String,
         outgoingInviteBody: ByteArray,
     ): OutgoingInviteRequestContext {
-        val outgoingInviteBaseRequestContext = buildOutgoingInviteBaseRequestContext(phoneNumber)
-        val normalizedPhoneNumber = outgoingInviteBaseRequestContext.normalizedPhoneNumber
-        val to = outgoingInviteBaseRequestContext.telUri
-        val sipInstance = outgoingInviteBaseRequestContext.sipInstance
-        val local = outgoingInviteBaseRequestContext.localEndpoint
-        val transport = outgoingInviteBaseRequestContext.transport
-        val myHeaders = outgoingInviteBaseRequestContext.baseHeaders
-        val outgoingInviteCarrierRequestShape = buildOutgoingInviteCarrierRequestShape(
-            normalizedPhoneNumber = normalizedPhoneNumber,
-            telUri = to,
-            baseHeaders = myHeaders,
-            sipInstance = sipInstance,
-            localEndpoint = local,
-            transport = transport,
-        )
-        return buildOutgoingInviteRequestContext(
+        val normalizedPhoneNumber = normalizeOutgoingDialTargetForTelUri(phoneNumber)
+        val localEndpoint =
+            if(socket.gLocalAddr() is Inet6Address)
+                "[${socket.gLocalAddr().hostAddress}]:${serverSocket.localPort}"
+            else
+                "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
+        val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
+        val outgoingInviteSessionTimer = inviteSessionTimerPolicy.currentForRealm(realm)
+
+        return SipOutgoingInviteRequestBuilder.build(
+            logTag = TAG,
+            phoneNumber = phoneNumber,
             outgoingInviteBody = outgoingInviteBody,
-            baseRequestContext = outgoingInviteBaseRequestContext,
-            carrierRequestShape = outgoingInviteCarrierRequestShape,
+            normalizedPhoneNumber = normalizedPhoneNumber,
+            mcc = mcc,
+            mnc = mnc,
+            mySip = mySip,
+            myTel = myTel,
+            imsi = imsi,
+            imei = imei,
+            commonHeaders = commonHeaders,
+            localEndpoint = localEndpoint,
+            transport = transport,
+            sessionExpiresSeconds = outgoingInviteSessionTimer.sessionExpiresSeconds,
+            minSeSeconds = outgoingInviteSessionTimer.minSeSeconds,
+            generatedCallIdHeaders = generateCallId(),
+            singtelStockOutgoingCarrier = isSingTelStockOutgoingCarrier(),
+            singtelPublicSipUri = { number -> singtelPublicSipUri(number) },
         )
     }
 
@@ -4362,16 +3723,13 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         response: SipResponse,
         expectedCallId: String,
     ): Boolean {
-        val responseCallId = response.headers["call-id"]?.getOrNull(0).orEmpty()
-        val responseCseqForLog = response.headers["cseq"]?.getOrNull(0)
-        val activeCallIdForResponse = currentCall?.callIdOrNull()
-        val pendingCallIdForResponse = pendingOutgoingInvite?.callId
-        if (responseCallId != expectedCallId ||
-            (activeCallIdForResponse != responseCallId && pendingCallIdForResponse != responseCallId)) {
-            Rlog.w(TAG, "Ignoring stale outgoing response: status=${response.statusCode} ${response.statusString} cseq=$responseCseqForLog callId=$responseCallId active=$activeCallIdForResponse pending=$pendingCallIdForResponse expected=$expectedCallId")
-            return true
-        }
-        return false
+        return SipOutgoingInviteResponseGuards.shouldIgnoreStaleResponse(
+            logTag = TAG,
+            response = response,
+            expectedCallId = expectedCallId,
+            activeCallIdForResponse = currentCall?.callIdOrNull(),
+            pendingCallIdForResponse = pendingOutgoingInvite?.callId,
+        )
     }
 
 
@@ -4379,123 +3737,58 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         response: SipResponse,
         cseq: String,
     ): Boolean? {
-        if (cseq.contains("ACK")) return false
-        if (!cseq.contains("BYE")) return null
+        val result = SipOutgoingInviteAckByeResponses.handle(
+            logTag = TAG,
+            response = response,
+            cseq = cseq,
+        ) ?: return null
 
-        val byeCallId = response.callIdOrEmpty()
-        if (response.statusCode in 200..299) {
-            Rlog.d(TAG, "Outgoing BYE accepted; clearing dialog callId=$byeCallId cseq=$cseq")
-        } else if (response.statusCode >= 300) {
-            Rlog.w(
-                TAG,
-                "Outgoing BYE failed; clearing local dialog anyway: " +
-                    "status=${response.statusCode} ${response.statusString} cseq=$cseq callId=$byeCallId",
+        val clearDialogCallId = result.clearDialogCallId
+        if (clearDialogCallId != null) {
+            currentCall = null
+            clearPendingOutgoingInvite(
+                clearDialogCallId,
+                closeRtpSocket = false,
+                reason = result.clearPendingReason
+                    ?: SipOutgoingInviteAckByeResponses.fallbackByeResponseCleanupReason(
+                        cseq = cseq,
+                        statusCode = response.statusCode,
+                    ),
             )
-        } else {
-            return false
         }
-        currentCall = null
-        clearPendingOutgoingInvite(
-            byeCallId,
-            closeRtpSocket = false,
-            reason = "outgoing BYE response $cseq ${response.statusCode}",
-        )
-        return true
+        return result.callbackResult
     }
 
-
-    private data class OutgoingPrackResponseState(
-        val response: SipResponse,
-        val cseq: String,
-        val rseqHandled: Boolean,
-        val callbackResult: Boolean? = null,
-    )
 
     private fun handleOutgoingPrackResponseIfNeeded(
         response: SipResponse,
         cseq: String,
         prackedReliableProvisionals: MutableSet<String>,
     ): OutgoingPrackResponseState {
-        if (!cseq.contains("PRACK")) {
-            return OutgoingPrackResponseState(
-                response = response,
-                cseq = cseq,
-                rseqHandled = false,
-            )
-        }
-
-        val savedProvisional = respInFlight
-        if (savedProvisional == null) {
-            Rlog.w(TAG, "Ignoring PRACK response without pending provisional response: status=${response.statusCode} ${response.statusString} cseq=$cseq")
-            return OutgoingPrackResponseState(
-                response = response,
-                cseq = cseq,
-                rseqHandled = false,
-                callbackResult = false,
-            )
-        }
-        if (response.statusCode >= 300) {
-            Rlog.w(TAG, "PRACK failed for pending provisional response: status=${response.statusCode} ${response.statusString} cseq=$cseq")
-            val failedReliableKey = "${savedProvisional.headers["rseq"]?.getOrNull(0).orEmpty()} ${savedProvisional.headers["cseq"]?.getOrNull(0).orEmpty()}"
-            if (prackedReliableProvisionals.remove(failedReliableKey)) {
-                Rlog.w(TAG, "Removing failed PRACK key so retransmitted reliable provisional can be retried: $failedReliableKey")
-            }
-            respInFlight = null
-            return OutgoingPrackResponseState(
-                response = response,
-                cseq = cseq,
-                rseqHandled = false,
-                callbackResult = false,
-            )
-        }
-
-        respInFlight = null
-        return OutgoingPrackResponseState(
-            response = savedProvisional,
-            cseq = savedProvisional.headers["cseq"]!![0],
-            rseqHandled = true,
+        val state = SipOutgoingInvitePrackResponses.handle(
+            logTag = TAG,
+            response = response,
+            cseq = cseq,
+            prackedReliableProvisionals = prackedReliableProvisionals,
+            savedProvisional = respInFlight,
         )
+        if (state.clearRespInFlight) {
+            respInFlight = null
+        }
+        return state
     }
 
-
-
-    private data class OutgoingFinalInviteAckRequest(
-        val request: SipRequest,
-        val inviteCseq: Int,
-    )
 
     private fun buildOutgoingFinalInviteAckRequest(
         response: SipResponse,
         myHeaders: Map<String, List<String>>,
         to: String,
     ): OutgoingFinalInviteAckRequest {
-        // ACK C-Seq must be the same as INVITE C-Seq
-        // Extract C-Seq
-        val cseqLine = response.headers["cseq"]!![0]
-        val cseq = cseqLine.split(" ")[0].toInt()
-        val newTo = response.headers["to"]!![0]
-        val newFrom = response.headers["from"]!![0]
-        // ACK to 2xx must be sent to the Contact from the response (RFC 3261 §13.2.2.4)
-        val ackTo = response.headers["contact"]?.get(0)
-            ?.let { extractDestinationFromContact(it) } ?: to
-        // ACK is a dialog request; route set comes from Record-Route in the 200 OK
-        // (RFC 3261 §12.1.2), not from the registration Service-Route in myHeaders.
-        val dialogRoute = response.headers["record-route"]
-        val ackHeaders = if (dialogRoute != null) myHeaders + ("route" to dialogRoute) else myHeaders
-        val msg =
-            SipRequest(
-                SipMethod.ACK,
-                ackTo,
-                ackHeaders - "content-type" + """
-                    CSeq: $cseq ACK
-                    To: $newTo
-                    From: $newFrom
-                    """.toSipHeadersMap()
-            )
-
-        return OutgoingFinalInviteAckRequest(
-            request = msg,
-            inviteCseq = cseq,
+        return SipOutgoingInviteFinalAck.buildAckRequest(
+            response = response,
+            myHeaders = myHeaders,
+            fallbackTarget = to,
+            extractDestinationFromContact = { contact -> extractDestinationFromContact(contact) },
         )
     }
 
@@ -4529,10 +3822,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             val routeHeader = confirmedCall.callHeaders["route"]
             Rlog.d(
                 TAG,
-                "Outgoing confirmed dialog after ACK: " +
-                    "remoteTarget=${confirmedCall.remoteContact} " +
-                    "nextLocalCseq=${confirmedCall.localCseq.get()} " +
-                    "route=$routeHeader",
+                SipOutgoingInviteFinalAckState.outgoingConfirmedDialogAfterAckLog(
+                    remoteTarget = confirmedCall.remoteContact,
+                    nextLocalCseq = confirmedCall.localCseq.get(),
+                    routeHeader = routeHeader,
+                ),
             )
         }
     }
@@ -4544,57 +3838,50 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         finalInviteHasSdp: Boolean,
     ): Boolean? {
         if (finalInviteAfterLocalCancel) {
-            Rlog.w(TAG, "Confirmed outgoing dialog after local CANCEL without final SDP; sending BYE immediately callId=$finalInviteCallId")
+            Rlog.w(TAG, SipOutgoingInviteFinalAckState.finalInviteAfterLocalCancelWithoutSdpLog(finalInviteCallId))
             currentCall?.let { sendByeForCall(it) }
             currentCall = null
-            clearPendingOutgoingInvite(finalInviteCallId, closeRtpSocket = true, reason = "final answer without SDP after local CANCEL")
+            clearPendingOutgoingInvite(
+                finalInviteCallId,
+                closeRtpSocket = true,
+                reason = SipOutgoingInviteFinalAckState.finalAnswerWithoutSdpAfterLocalCancelReason(),
+            )
             return true
         } else if (!finalInviteHasSdp) {
-            clearPendingOutgoingInvite(finalInviteCallId, closeRtpSocket = false, reason = "final INVITE answer without SDP")
+            clearPendingOutgoingInvite(
+            finalInviteCallId,
+            closeRtpSocket = false,
+            reason = SipOutgoingInviteFinalAckState.finalInviteAnswerWithoutSdpReason(),
+        )
             val confirmedOutgoingCall = currentCall
             if (confirmedOutgoingCall != null) {
                 confirmedOutgoingCall.outgoingRtpReceived.set(false)
-                Rlog.d(TAG, "Final outgoing answer received; clearing early-media RTP gate until post-answer RTP arrives callId=$finalInviteCallId")
+                Rlog.d(TAG, SipOutgoingInviteFinalAckState.finalInviteAnswerClearsEarlyMediaGateLog(finalInviteCallId))
                 scheduleOutgoingPostAnswerRtpTimeout(finalInviteCallId)
-                maybeNotifyOutgoingCallConnected(confirmedOutgoingCall, "final INVITE answer")
+                maybeNotifyOutgoingCallConnected(
+                    confirmedOutgoingCall,
+                    SipOutgoingInviteFinalAckState.finalInviteAnswerConnectedReason(),
+                )
             } else {
-                Rlog.w(TAG, "Final INVITE answer but currentCall is null after ACK callId=$finalInviteCallId")
+                Rlog.w(TAG, SipOutgoingInviteFinalAckState.finalInviteAnswerCurrentCallMissingLog(finalInviteCallId))
             }
         }
         return null
     }
 
 
-    private data class OutgoingFinalInviteAckState(
-        val responseCseq: String,
-        val finalInviteCallId: String,
-        val finalInviteAfterLocalCancel: Boolean,
-        val finalInviteHasSdp: Boolean,
-    )
-
     private fun outgoingFinalInviteAckState(response: SipResponse): OutgoingFinalInviteAckState? {
-        val responseCseq = response.headers["cseq"]?.getOrNull(0).orEmpty()
-        if (!responseCseq.contains("INVITE") || (response.statusCode != 200 && response.statusCode != 202)) {
-            return null
-        }
-
         val finalInviteCallId = response.callIdOrEmpty()
         val finalInviteAfterLocalCancel = pendingOutgoingInvite?.callId == finalInviteCallId &&
             pendingOutgoingInvite?.cancelSent?.get() == true
-        val finalInviteHasSdp =
-            response.headers["content-type"]?.getOrNull(0) == "application/sdp"
 
-        if (finalInviteAfterLocalCancel) {
-            Rlog.w(TAG, "Final INVITE answer arrived after local CANCEL; ACK first, then BYE once dialog state exists callId=$finalInviteCallId")
-        }
-
-        return OutgoingFinalInviteAckState(
-            responseCseq = responseCseq,
-            finalInviteCallId = finalInviteCallId,
+        return SipOutgoingInviteFinalAckState.fromResponse(
+            logTag = TAG,
+            response = response,
             finalInviteAfterLocalCancel = finalInviteAfterLocalCancel,
-            finalInviteHasSdp = finalInviteHasSdp,
         )
     }
+
 
     private fun handleOutgoingFinalInviteAckIfNeeded(
         response: SipResponse,
@@ -4613,7 +3900,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         )
         val msg2 = outgoingFinalInviteAckRequest.request
         val cseq = outgoingFinalInviteAckRequest.inviteCseq
-        Rlog.d(TAG, "Sending $msg2")
+        Rlog.d(TAG, SipOutgoingInviteFinalAckState.sendingFinalInviteAckLog(msg2))
         synchronized(socket.gWriter()) { socket.gWriter().write(msg2.toByteArray()); socket.gWriter().flush() }
         callStarted.set(true)
         updateOutgoingDialogAfterFinalInviteAck(
@@ -4638,29 +3925,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             return null
         }
 
-        Rlog.d(TAG, "Invite got status ${response.statusCode} = ${response.statusString}")
-        if (response.statusCode in 180..199) {
-            val progressCseq = response.headers["cseq"]?.getOrNull(0).orEmpty()
-            val progressHasSdp = response.headers["content-type"]?.getOrNull(0)
-                ?.equals("application/sdp", ignoreCase = true) == true
-
-            if (progressCseq.contains("INVITE", ignoreCase = true) && !progressHasSdp) {
-                Rlog.d(
-                    TAG,
-                    "Outgoing call progressing without SDP: " +
-                        "status=${response.statusCode} ${response.statusString} cseq=$progressCseq",
-                )
-                onOutgoingCallProgressing?.invoke(
-                    Object(),
-                    mapOf(
-                        "call-id" to response.callIdOrEmpty(),
-                        "statusCode" to response.statusCode.toString(),
-                        "statusString" to response.statusString,
-                        "cseq" to progressCseq,
-                        "local-ringback" to "true",
-                    ),
-                )
-            }
+        SipOutgoingInviteProgressResponses.progressNotification(
+            logTag = TAG,
+            response = response,
+        )?.let { progress ->
+            onOutgoingCallProgressing?.invoke(Object(), progress.extras)
         }
 
         if(response.statusCode >= 400) {
@@ -4677,7 +3946,16 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             val pendingCallId = pendingOutgoingInvite?.callId
 
             if (activeCallId != failedCallId && pendingCallId != failedCallId) {
-                Rlog.w(TAG, "Ignoring stale outgoing dialog failure: status=${response.statusCode} ${response.statusString} cseq=$failedCseq callId=$failedCallId active=$activeCallId pending=$pendingCallId")
+                Rlog.w(
+                    TAG,
+                    SipOutgoingInviteProgressResponses.staleOutgoingDialogFailureLog(
+                        response = response,
+                        failedCseq = failedCseq,
+                        failedCallId = failedCallId,
+                        activeCallId = activeCallId,
+                        pendingCallId = pendingCallId,
+                    ),
+                )
                 return true
             }
 
@@ -4689,25 +3967,48 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 return false
             }
 
-            Rlog.w(TAG, "Outgoing dialog request failed: status=${response.statusCode} ${response.statusString} cseq=$failedCseq callId=$failedCallId")
-            stopCallRuntime("outgoing dialog failure")
+            Rlog.w(
+                TAG,
+                SipOutgoingInviteProgressResponses.outgoingDialogRequestFailedLog(
+                    response = response,
+                    failedCseq = failedCseq,
+                    failedCallId = failedCallId,
+                ),
+            )
+            stopCallRuntime(SipOutgoingInviteProgressResponses.outgoingDialogFailureCleanupReason())
 
             val failedPending = pendingOutgoingInvite
             if (failedPending != null && failedPending.callId == failedCallId &&
                 !failedCseq.contains("INVITE") && !failedPending.cancelSent.get()) {
-                Rlog.w(TAG, "Early outgoing in-dialog request failed; cancelling pending INVITE callId=$failedCallId")
-                sendCancelForPendingOutgoingInvite(failedPending, "early dialog request failed: $failedCseq ${response.statusCode}")
+                Rlog.w(TAG, SipOutgoingInviteProgressResponses.earlyOutgoingInDialogRequestFailedLog(failedCallId))
+                sendCancelForPendingOutgoingInvite(
+                    failedPending,
+                    SipOutgoingInviteProgressResponses.earlyDialogRequestFailedCancelReason(
+                        failedCseq = failedCseq,
+                        statusCode = response.statusCode,
+                    ),
+                )
             }
 
             if (activeCallId == failedCallId) {
                 currentCall = null
             }
-            clearPendingOutgoingInvite(failedCallId, closeRtpSocket = activeCallId != failedCallId, reason = "outgoing dialog failure $failedCseq ${response.statusCode}")
-            onCancelledCall?.invoke(Object(), "",
-                mapOf(
-                    "statusCode" to response.statusCode.toString(),
-                    "statusString" to response.statusString,
-                    "cseq" to failedCseq))
+            clearPendingOutgoingInvite(
+                failedCallId,
+                closeRtpSocket = activeCallId != failedCallId,
+                reason = SipOutgoingInviteProgressResponses.outgoingDialogFailurePendingCleanupReason(
+                    failedCseq = failedCseq,
+                    statusCode = response.statusCode,
+                ),
+            )
+            onCancelledCall?.invoke(
+                Object(),
+                "",
+                SipOutgoingInviteProgressResponses.outgoingDialogFailureCancellationExtras(
+                    response = response,
+                    failedCseq = failedCseq,
+                ),
+            )
             // The whole call failed, so drop that call-id
             return true
         }
@@ -4722,20 +4023,24 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         outgoingDialogNextCseq: AtomicInteger,
         prackedReliableProvisionals: MutableSet<String>,
     ): Boolean? {
-        if (response.headers["rseq"]?.isNotEmpty() != true || rseqHandled) return null
-
-        val reliableKey = "${response.headers["rseq"]?.getOrNull(0).orEmpty()} ${response.headers["cseq"]?.getOrNull(0).orEmpty()}"
-        if (!prackedReliableProvisionals.add(reliableKey)) {
-            Rlog.w(TAG, "Ignoring duplicate reliable provisional response already PRACKed: $reliableKey")
-            return false
-        }
+        val reliableProvisional = SipOutgoingInviteReliableProvisionals.classify(
+            logTag = TAG,
+            response = response,
+            rseqHandled = rseqHandled,
+            prackedReliableProvisionals = prackedReliableProvisionals,
+        ) ?: return null
+        reliableProvisional.callbackResult?.let { return it }
+        val reliableKey = reliableProvisional.reliableKey
         val currentCallNextCseq = currentCall?.localCseq?.get() ?: 0
         val allocatorNextCseq = outgoingDialogNextCseq.get()
         if (currentCallNextCseq > allocatorNextCseq) {
             Rlog.d(
                 TAG,
-                "Syncing outgoing PRACK CSeq allocator from current call: " +
-                    "allocator=$allocatorNextCseq currentCallNext=$currentCallNextCseq key=$reliableKey",
+                SipOutgoingInviteReliableProvisionals.syncingPrackCseqAllocatorLog(
+                    allocatorNextCseq = allocatorNextCseq,
+                    currentCallNextCseq = currentCallNextCseq,
+                    reliableKey = reliableKey,
+                ),
             )
             outgoingDialogNextCseq.set(currentCallNextCseq)
         }
@@ -4750,219 +4055,32 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         prack(response, prackCseq)
         Rlog.d(
             TAG,
-            "Outgoing PRACK consumed local CSeq=$prackCseq " +
-                "nextAllocatorCseq=${outgoingDialogNextCseq.get()} " +
-                "currentCallNextCseq=${currentCall?.localCseq?.get()} key=$reliableKey",
+            SipOutgoingInviteReliableProvisionals.prackConsumedLocalCseqLog(
+                prackCseq = prackCseq,
+                nextAllocatorCseq = outgoingDialogNextCseq.get(),
+                currentCallNextCseq = currentCall?.localCseq?.get(),
+                reliableKey = reliableKey,
+            ),
         )
         respInFlight = response
         return false
     }
 
 
-    private data class OutgoingDialogSdpAnswer(
-        val isPrecondition: Boolean,
-        val respSdp: List<String>,
-        val dialogAudioCodec: NegotiatedAudioCodec,
-        val dialogAmrTrack: Int,
-        val dialogAmrTrackDesc: String,
-        val dialogDtmfTrack: Int,
-        val dialogDtmfTrackDesc: String,
-        val rtpRemoteAddr: InetAddress,
-        val rtpRemotePortInt: Int,
-    )
-
-
-    private data class OutgoingDialogMediaSelection(
-        val dialogAudioCodec: NegotiatedAudioCodec,
-        val dialogAmrTrack: Int,
-        val dialogAmrTrackDesc: String,
-        val dialogDtmfTrack: Int,
-        val dialogDtmfTrackDesc: String,
-    )
-
-    private fun selectOutgoingDialogMediaFromSdpAnswer(
-        response: SipResponse,
-        respSdp: List<String>,
-        respAttributes: List<String>,
-        amrNbTrack: Int,
-        dtmfNbTrack: Int,
-    ): OutgoingDialogMediaSelection {
-        fun sdpElement(command: String): String? {
-            val v = respSdp.firstOrNull { it.startsWith("$command=")} ?: return null
-            return v.substring(2)
-        }
-
-        fun responseTrackRequirements(track: Int): String? =
-            respAttributes.firstOrNull { it.startsWith("fmtp:$track") }
-
-        fun lookResponseTrackMatching(codec: String, notAdditional: String = ""): Pair<Int, String>? {
-            val offeredPayloads = sdpElement("m")
-                ?.trim()
-                ?.split("\\s+".toRegex())
-                ?.drop(3)
-                ?.mapNotNull { it.toIntOrNull() }
-                ?.toSet()
-                .orEmpty()
-            val maps = respAttributes.filter { it.startsWith("rtpmap:") && it.contains(codec) }
-            val matches = maps.mapNotNull { m ->
-                val track = m.split("[: ]+".toRegex()).getOrNull(1)?.toIntOrNull()
-                if (track != null && offeredPayloads.contains(track)) Pair(track, m) else null
-            }
-            val sorted = matches.sortedBy { m ->
-                val fmtp = responseTrackRequirements(m.first).orEmpty()
-                when {
-                    fmtp.contains("octet-align=1", ignoreCase = true) &&
-                        notAdditional.isNotEmpty() &&
-                        fmtp.contains(notAdditional, ignoreCase = true) -> 100
-                    fmtp.contains("octet-align=1", ignoreCase = true) -> 100
-                    else -> 0
-                }
-            }
-            Rlog.d(TAG, "Outgoing answer matching $codec offered=$offeredPayloads got=$sorted")
-            return sorted.firstOrNull()
-        }
-
-        val selectedAudioCodec = SipAudioCodecNegotiator.selectOutgoingSpeechCodecFromAnswer(
-            logTag = TAG,
-            sdp = respSdp,
-            context = "outgoing SDP response ${response.statusCode} callId=${response.callIdOrEmpty()}",
-            amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
-        )
-        val selectedAmr = lookResponseTrackMatching(
-            SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec),
-            notAdditional = "octet-align=1",
-        )
-        if (selectedAmr == null) {
-            Rlog.w(
-                TAG,
-                "Outgoing SDP response lacks compatible ${SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec)}; " +
-                    "falling back to AMR-NB/8000 tracks",
-            )
-        }
-        val selectedDtmf = lookResponseTrackMatching(
-            SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec),
-        )
-        if (selectedDtmf == null) {
-            Rlog.w(
-                TAG,
-                "Outgoing SDP response lacks compatible ${SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec)}; " +
-                    "falling back to telephone-event/8000",
-            )
-        }
-        val dialogAudioCodec =
-            if (selectedAmr != null && selectedDtmf != null) selectedAudioCodec else SipAudioCodecs.AMR_NB
-        val (dialogAmrTrack, dialogAmrTrackDesc) =
-            selectedAmr?.takeIf { selectedDtmf != null } ?: (amrNbTrack to "rtpmap:$amrNbTrack AMR/8000/1")
-        val (dialogDtmfTrack, dialogDtmfTrackDesc) =
-            selectedDtmf?.takeIf { selectedAmr != null } ?: (dtmfNbTrack to "rtpmap:$dtmfNbTrack telephone-event/8000")
-
-        return OutgoingDialogMediaSelection(
-            dialogAudioCodec = dialogAudioCodec,
-            dialogAmrTrack = dialogAmrTrack,
-            dialogAmrTrackDesc = dialogAmrTrackDesc,
-            dialogDtmfTrack = dialogDtmfTrack,
-            dialogDtmfTrackDesc = dialogDtmfTrackDesc,
-        )
-    }
-
-
-    private data class OutgoingDialogRtpEndpoint(
-        val rtpRemoteAddr: InetAddress,
-        val rtpRemotePortInt: Int,
-    )
-
-    private fun connectOutgoingDialogRtpEndpointFromSdpAnswer(
-        respSdp: List<String>,
-        rtpSocket: DatagramSocket,
-    ): OutgoingDialogRtpEndpoint {
-        fun sdpElement(command: String): String? {
-            val v = respSdp.firstOrNull { it.startsWith("$command=")} ?: return null
-            return v.substring(2)
-        }
-
-        val rtpRemotePort = sdpElement("m")!!.split(" ")[1]
-        val rtpRemoteAddr = InetAddress.getByName(sdpElement("c")!!.split(" ")[2])
-        val rtpRemotePortInt = rtpRemotePort.toInt()
-        try {
-            if (!rtpSocket.isConnected || rtpSocket.inetAddress != rtpRemoteAddr || rtpSocket.port != rtpRemotePortInt) {
-                rtpSocket.connect(rtpRemoteAddr, rtpRemotePortInt)
-                Rlog.d(TAG, "Outgoing RTP socket connected to ${rtpRemoteAddr}:${rtpRemotePortInt} local=${rtpSocket.localAddress}:${rtpSocket.localPort}")
-            }
-        } catch (e: Exception) {
-            Rlog.w(TAG, "Failed to connect outgoing RTP socket to ${rtpRemoteAddr}:${rtpRemotePortInt}", e)
-        }
-
-        return OutgoingDialogRtpEndpoint(
-            rtpRemoteAddr = rtpRemoteAddr,
-            rtpRemotePortInt = rtpRemotePortInt,
-        )
-    }
-
-
-    private fun buildOutgoingDialogSdpAnswer(
-        isPrecondition: Boolean,
-        respSdp: List<String>,
-        mediaSelection: OutgoingDialogMediaSelection,
-        rtpEndpoint: OutgoingDialogRtpEndpoint,
-    ): OutgoingDialogSdpAnswer =
-        OutgoingDialogSdpAnswer(
-            isPrecondition = isPrecondition,
-            respSdp = respSdp,
-            dialogAudioCodec = mediaSelection.dialogAudioCodec,
-            dialogAmrTrack = mediaSelection.dialogAmrTrack,
-            dialogAmrTrackDesc = mediaSelection.dialogAmrTrackDesc,
-            dialogDtmfTrack = mediaSelection.dialogDtmfTrack,
-            dialogDtmfTrackDesc = mediaSelection.dialogDtmfTrackDesc,
-            rtpRemoteAddr = rtpEndpoint.rtpRemoteAddr,
-            rtpRemotePortInt = rtpEndpoint.rtpRemotePortInt,
-        )
-
     private fun parseOutgoingDialogSdpAnswer(
         response: SipResponse,
         rtpSocket: DatagramSocket,
         amrNbTrack: Int,
         dtmfNbTrack: Int,
-    ): OutgoingDialogSdpAnswer? {
-        val isSdp = response.headers["content-type"]?.get(0) == "application/sdp"
-        val isPrecondition = response.headers["require"]?.find { it.contains("precondition") } != null
-
-        if (!isSdp) return null
-
-        val respSdp = response.body.toString(Charsets.UTF_8).split("[\r\n]+".toRegex()).toList()
-        SipAudioCodecSdpLogger.logRemoteAudioCodecCandidates(
-            tag = TAG,
-            context = "outgoing SDP response ${response.statusCode} callId=${response.callIdOrEmpty()}",
-            sdp = respSdp,
-        )
-
-        val respAttributes = respSdp
-            .filter { it.startsWith("a=") }
-            .map { it.substring(2) }
-        val outgoingDialogMediaSelection = selectOutgoingDialogMediaFromSdpAnswer(
+    ): OutgoingDialogSdpAnswer? =
+        SipOutgoingDialogSdp.parseAnswer(
+            logTag = TAG,
             response = response,
-            respSdp = respSdp,
-            respAttributes = respAttributes,
+            rtpSocket = rtpSocket,
             amrNbTrack = amrNbTrack,
             dtmfNbTrack = dtmfNbTrack,
+            amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
         )
-        val outgoingDialogRtpEndpoint = connectOutgoingDialogRtpEndpointFromSdpAnswer(
-            respSdp = respSdp,
-            rtpSocket = rtpSocket,
-        )
-
-        return buildOutgoingDialogSdpAnswer(
-            isPrecondition = isPrecondition,
-            respSdp = respSdp,
-            mediaSelection = outgoingDialogMediaSelection,
-            rtpEndpoint = outgoingDialogRtpEndpoint,
-        )
-    }
-
-
-    private data class OutgoingDialogSdpInstallResult(
-        val responseCseq: String,
-        val outgoingMediaFormatChanged: Boolean,
-    )
 
 
     private fun buildOutgoingDialogCallFromSdpAnswer(
@@ -5000,19 +4118,19 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         response: SipResponse,
         responseCseq: String,
     ) {
-        val outgoingDialogPhase = when {
-            responseCseq.contains("UPDATE") -> "update"
-            responseCseq.contains("INVITE") && (response.statusCode == 200 || response.statusCode == 202) -> "final-answer"
-            response.statusCode in 180..199 -> "early"
-            else -> "sdp"
-        }
+        val outgoingDialogCallForLog = currentCall
         Rlog.d(
             TAG,
-            "Outgoing $outgoingDialogPhase dialog SDP: status=${response.statusCode} cseq=$responseCseq " +
-                "codec=${currentCall?.audioCodec?.name}/${currentCall?.audioCodec?.sampleRate} " +
-                "amrTrack=${currentCall?.amrTrack} dtmfTrack=${currentCall?.dtmfTrack} " +
-                "remoteTarget=${currentCall?.remoteContact} nextLocalCseq=${currentCall?.localCseq?.get()} " +
-                "route=${currentCall?.callHeaders?.get("route")}",
+            SipOutgoingDialogSdp.installLogMessage(
+                response = response,
+                responseCseq = responseCseq,
+                audioCodec = outgoingDialogCallForLog?.audioCodec,
+                amrTrack = outgoingDialogCallForLog?.amrTrack,
+                dtmfTrack = outgoingDialogCallForLog?.dtmfTrack,
+                remoteTarget = outgoingDialogCallForLog?.remoteContact,
+                nextLocalCseq = outgoingDialogCallForLog?.localCseq?.get(),
+                route = outgoingDialogCallForLog?.callHeaders?.get("route"),
+            ),
         )
     }
 
@@ -5022,33 +4140,21 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         responseCseq: String,
         previousOutgoingDialogCall: Call?,
         answer: OutgoingDialogSdpAnswer,
-    ): Boolean {
-        val outgoingMediaFormatChanged =
-            threadsStarted.get() &&
-                previousOutgoingDialogCall != null &&
-                responseCseq.contains("INVITE") &&
-                (response.statusCode == 200 || response.statusCode == 202) &&
-                (
-                    previousOutgoingDialogCall.audioCodec != answer.dialogAudioCodec ||
-                        previousOutgoingDialogCall.amrTrack != answer.dialogAmrTrack ||
-                        previousOutgoingDialogCall.dtmfTrack != answer.dialogDtmfTrack ||
-                        previousOutgoingDialogCall.rtpRemoteAddr != answer.rtpRemoteAddr ||
-                        previousOutgoingDialogCall.rtpRemotePort != answer.rtpRemotePortInt
-                )
-        if (outgoingMediaFormatChanged) {
-            Rlog.w(
-                TAG,
-                "Outgoing final INVITE SDP changed running media format: " +
-                    "oldCodec=${previousOutgoingDialogCall?.audioCodec?.name}/${previousOutgoingDialogCall?.audioCodec?.sampleRate} " +
-                    "oldAmr=${previousOutgoingDialogCall?.amrTrack} oldDtmf=${previousOutgoingDialogCall?.dtmfTrack} " +
-                    "oldRtp=${previousOutgoingDialogCall?.rtpRemoteAddr}:${previousOutgoingDialogCall?.rtpRemotePort} " +
-                    "newCodec=${answer.dialogAudioCodec.name}/${answer.dialogAudioCodec.sampleRate} " +
-                    "newAmr=${answer.dialogAmrTrack} newDtmf=${answer.dialogDtmfTrack} " +
-                    "newRtp=${answer.rtpRemoteAddr}:${answer.rtpRemotePortInt}",
-            )
-        }
-        return outgoingMediaFormatChanged
-    }
+    ): Boolean =
+        SipOutgoingDialogSdp.finalInviteMediaFormatChanged(
+            logTag = TAG,
+            threadsStarted = threadsStarted.get(),
+            response = response,
+            responseCseq = responseCseq,
+            previousDialogPresent = previousOutgoingDialogCall != null,
+            previousAudioCodec = previousOutgoingDialogCall?.audioCodec,
+            previousAmrTrack = previousOutgoingDialogCall?.amrTrack,
+            previousDtmfTrack = previousOutgoingDialogCall?.dtmfTrack,
+            previousRtpRemoteAddr = previousOutgoingDialogCall?.rtpRemoteAddr,
+            previousRtpRemotePort = previousOutgoingDialogCall?.rtpRemotePort,
+            answer = answer,
+        )
+
 
     private fun installOutgoingDialogFromSdpAnswer(
         response: SipResponse,
@@ -5057,11 +4163,10 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         rtpSocket: DatagramSocket,
         answer: OutgoingDialogSdpAnswer,
     ): OutgoingDialogSdpInstallResult {
-        val inviteCseqForDialog = response.headers["cseq"]!![0].substringBefore(" ").toIntOrNull() ?: 1
-        val nextLocalCseqForDialog = maxOf(
-            inviteCseqForDialog + 1,
-            outgoingDialogNextCseq.get(),
-            currentCall?.localCseq?.get() ?: 0,
+        val nextLocalCseqForDialog = SipOutgoingDialogSdp.nextLocalCseqForDialog(
+            response = response,
+            outgoingDialogNextCseq = outgoingDialogNextCseq.get(),
+            currentCallLocalCseq = currentCall?.localCseq?.get() ?: 0,
         )
         // PhhIms: final INVITE SDP media restart.
         // Keep the media state selected by a provisional 183 before replacing
@@ -5106,39 +4211,73 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         outgoingMediaFormatChanged: Boolean,
         answer: OutgoingDialogSdpAnswer,
     ): Boolean? {
-        if (!responseCseq.contains("INVITE") || (response.statusCode != 200 && response.statusCode != 202)) {
-            return null
-        }
-
-        val finalInviteCallId = response.callIdOrEmpty()
-        val finalInviteAfterLocalCancel = pendingOutgoingInvite?.callId == finalInviteCallId &&
+        val responseCallId = response.callIdOrEmpty()
+        val finalInviteAfterLocalCancel = pendingOutgoingInvite?.callId == responseCallId &&
             pendingOutgoingInvite?.cancelSent?.get() == true
-        if (finalInviteAfterLocalCancel) {
-            Rlog.w(TAG, "Confirmed outgoing dialog after local CANCEL; sending BYE immediately callId=$finalInviteCallId")
+        val finalInviteSdpMediaState = SipOutgoingDialogSdp.finalInviteSdpMediaState(
+            logTag = TAG,
+            response = response,
+            responseCseq = responseCseq,
+            finalInviteAfterLocalCancel = finalInviteAfterLocalCancel,
+        ) ?: return null
+
+        val finalInviteCallId = finalInviteSdpMediaState.finalInviteCallId
+        if (finalInviteSdpMediaState.finalInviteAfterLocalCancel) {
             currentCall?.let { sendByeForCall(it) }
             currentCall = null
-            clearPendingOutgoingInvite(finalInviteCallId, closeRtpSocket = true, reason = "final answer after local CANCEL")
+            clearPendingOutgoingInvite(
+                finalInviteCallId,
+                closeRtpSocket = true,
+                reason = SipOutgoingDialogSdp.finalAnswerAfterLocalCancelReason(),
+            )
             return true
         }
 
-        clearPendingOutgoingInvite(finalInviteCallId, closeRtpSocket = false, reason = "final INVITE answer")
-        if (threadsStarted.compareAndSet(false, true)) {
-            Rlog.d(TAG, "Starting outgoing media threads from final INVITE SDP")
-            callDecodeThread()
-            callEncodeThread()
-        } else if (outgoingMediaFormatChanged) {
-            val mediaRestartGeneration = callGeneration.incrementAndGet()
-            Rlog.w(
-                TAG,
-                "Restarting outgoing media threads after final INVITE SDP media change: " +
-                    "generation=$mediaRestartGeneration " +
-                    "codec=${answer.dialogAudioCodec.name}/${answer.dialogAudioCodec.sampleRate} " +
-                    "amrTrack=${answer.dialogAmrTrack} dtmfTrack=${answer.dialogDtmfTrack}",
-            )
-            callDecodeThread()
-            callEncodeThread()
-        } else {
-            Rlog.d(TAG, "Outgoing media threads already started before final INVITE SDP")
+        clearPendingOutgoingInvite(
+            finalInviteCallId,
+            closeRtpSocket = false,
+            reason = SipOutgoingDialogSdp.finalInviteAnswerReason(),
+        )
+        val finalInviteMediaAction = SipOutgoingDialogSdp.finalInviteMediaThreadAction(
+            startedNow = threadsStarted.compareAndSet(false, true),
+            outgoingMediaFormatChanged = outgoingMediaFormatChanged,
+        )
+        when (finalInviteMediaAction) {
+            OutgoingFinalInviteMediaThreadAction.START -> {
+                Rlog.d(
+                    TAG,
+                    SipOutgoingDialogSdp.finalInviteMediaThreadLogMessage(
+                        action = finalInviteMediaAction,
+                        mediaRestartGeneration = null,
+                        answer = answer,
+                    ),
+                )
+                callDecodeThread()
+                callEncodeThread()
+            }
+            OutgoingFinalInviteMediaThreadAction.RESTART -> {
+                val mediaRestartGeneration = callGeneration.incrementAndGet()
+                Rlog.w(
+                    TAG,
+                    SipOutgoingDialogSdp.finalInviteMediaThreadLogMessage(
+                        action = finalInviteMediaAction,
+                        mediaRestartGeneration = mediaRestartGeneration,
+                        answer = answer,
+                    ),
+                )
+                callDecodeThread()
+                callEncodeThread()
+            }
+            OutgoingFinalInviteMediaThreadAction.ALREADY_STARTED -> {
+                Rlog.d(
+                    TAG,
+                    SipOutgoingDialogSdp.finalInviteMediaThreadLogMessage(
+                        action = finalInviteMediaAction,
+                        mediaRestartGeneration = null,
+                        answer = answer,
+                    ),
+                )
+            }
         }
         return false
     }
@@ -5153,64 +4292,43 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     ): Boolean? {
         if (!isPrecondition || response.statusCode != 183) return null
 
-        Rlog.d(TAG, "Handling precondition...")
-        val currLocal = respSdp.first { it.startsWith("a=curr:qos local")}
-        // No resource has been allocated at either side
-        val localNone = currLocal.contains("none")
-        Rlog.d(TAG, "precondition: Curr is $currLocal $localNone")
-        val currRemote = respSdp.first { it.startsWith("a=curr:qos remote")}
-        val remoteNone = currRemote.contains("none")
-        val remoteHasLocalQos = currLocal.contains("sendrecv")
-        val needsLocalQosUpdate = localNone || remoteNone
-        Rlog.d(TAG, "precondition: Remote is $currRemote remoteNone=$remoteNone remoteHasLocalQos=$remoteHasLocalQos needsLocalQosUpdate=$needsLocalQosUpdate")
+        val preconditionState = SipOutgoingDialogSdp.precondition183State(
+            logTag = TAG,
+            respSdp = respSdp,
+        )
+        val remoteHasLocalQos = preconditionState.remoteHasLocalQos
+        val needsLocalQosUpdate = preconditionState.needsLocalQosUpdate
         if (needsLocalQosUpdate) {
             // "Allocating our local resource" and update the call
             if (threadsStarted.compareAndSet(false, true)) {
-                Rlog.d(TAG, "Starting outgoing media threads from precondition 183 SDP")
+                Rlog.d(TAG, SipOutgoingDialogSdp.startingOutgoingMediaFromPrecondition183SdpLog())
                 callDecodeThread()
                 callEncodeThread()
             }
 
-            val remoteMaxptimeLine = respSdp.firstOrNull { it.startsWith("a=maxptime:") } ?: "a=maxptime:40"
-
-            val localUpdateSdpLines = originalInviteSdp.toString(Charsets.UTF_8)
-                .split("[\r\n]+".toRegex())
-                .filter { it.isNotBlank() }
-                .map { line ->
-                    when {
-                        line.startsWith("o=") -> {
-                            val v = currentCall?.localSdpVersion?.incrementAndGet() ?: 3
-                            line.replace(Regex("^(o=\\S+\\s+\\S+\\s+)\\S+(\\s+IN\\s+IP[46]\\s+.*)$"), "$1$v$2")
-                        }
-                        line.startsWith("a=maxptime:") -> remoteMaxptimeLine
-                        line.startsWith("a=curr:qos local") -> "a=curr:qos local sendrecv"
-                        line.startsWith("a=curr:qos remote") -> if (remoteHasLocalQos) "a=curr:qos remote sendrecv" else "a=curr:qos remote none"
-                        else -> line
-                    }
-                }
-                .let { lines ->
-                    if (lines.any { it.startsWith("a=conf:qos remote") }) {
-                        lines
-                    } else {
-                        lines + "a=conf:qos remote sendrecv"
-                    }
-                }
-
-            val newSdp = localUpdateSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
+            val newSdp = SipOutgoingDialogSdp.buildPreconditionUpdateSdp(
+                originalInviteSdp = originalInviteSdp,
+                respSdp = respSdp,
+                remoteHasLocalQos = remoteHasLocalQos,
+                nextLocalSdpVersion = { currentCall?.localSdpVersion?.incrementAndGet() ?: 3 },
+            )
 
             val updateHeaders = localDialogHeadersForRequest(currentCall!!, SipMethod.UPDATE) -
                 "content-length" +
                 ("content-type" to listOf("application/sdp"))
 
-            val msg2 =
-                SipRequest(
-                    SipMethod.UPDATE,
-                    currentCall!!.remoteContact ?: fallbackTarget,
-                    updateHeaders,
-                    newSdp
-                )
-            Rlog.d(TAG, "Sending $msg2")
-            writeSipBytesWithFlush(socket.gWriter(), "SipHandler msg2", msg2.toByteArray())
+            val msg2 = SipOutgoingDialogSdp.buildPreconditionUpdateRequest(
+                remoteContact = currentCall!!.remoteContact,
+                fallbackTarget = fallbackTarget,
+                updateHeaders = updateHeaders,
+                newSdp = newSdp,
+            )
+            Rlog.d(TAG, SipOutgoingDialogSdp.sendingPreconditionUpdateLog(msg2))
+            writeSipBytesWithFlush(
+                socket.gWriter(),
+                SipOutgoingDialogSdp.preconditionUpdateWriteLabel(),
+                msg2.toByteArray(),
+            )
         }
 
         return false
@@ -5221,10 +4339,14 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         response: SipResponse,
         isPrecondition: Boolean,
     ) {
-        if (isPrecondition || response.statusCode != 183) return
+        if (!SipOutgoingDialogSdp.shouldStartMediaForNonPrecondition183(
+                response = response,
+                isPrecondition = isPrecondition,
+            )
+        ) return
 
         if (threadsStarted.compareAndSet(false, true)) {
-            Rlog.d(TAG, "Starting outgoing media threads from non-precondition 183 SDP")
+            Rlog.d(TAG, SipOutgoingDialogSdp.startingOutgoingMediaFromNonPrecondition183SdpLog())
             callDecodeThread()
             callEncodeThread()
         }
@@ -5233,17 +4355,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
     private fun handleOutgoingUpdateSdpResponseIfNeeded(
         response: SipResponse,
-    ): Boolean? {
-        // This isn't the answer to our INVITE, but to our later precondition UPDATE
-        // TODO Actually check cseq
-        if(response.headers["cseq"]?.get(0)?.contains("UPDATE") == true) {
-            if(response.statusCode == 200) {
-                // Nothing to do here, we've already upgraded the call with the new SDP, everything's fine
-                return false
-            }
-        }
-        return null
-    }
+    ): Boolean? =
+        SipOutgoingInviteUpdateResponses.handleIfNeeded(response)
 
 
     private fun handleOutgoingDialogSdpResponse(
@@ -5394,35 +4507,20 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
 
 
-    private data class InitialOutgoingInviteSendState(
-        val callId: String,
-        val outgoingDialogNextCseq: AtomicInteger,
-    )
-
     private fun prepareInitialOutgoingInviteSendState(
         msg: SipRequest,
         destination: String,
         rtpSocket: DatagramSocket,
         body: ByteArray,
     ): InitialOutgoingInviteSendState {
-        val outgoingInviteCallId = msg.headers["call-id"]!![0]
-        val outgoingInviteCseq = msg.headers["cseq"]?.getOrNull(0)
-            ?.substringBefore(" ")
-            ?.toIntOrNull()
-            ?: 1
-        val outgoingDialogNextCseq = AtomicInteger(outgoingInviteCseq + 1)
-        pendingOutgoingInvite = PendingOutgoingInvite(
-            callId = outgoingInviteCallId,
+        val prepared = SipOutgoingInviteInitialSend.prepare(
+            msg = msg,
             destination = destination,
-            headers = msg.headers,
             rtpSocket = rtpSocket,
             body = body,
         )
-
-        return InitialOutgoingInviteSendState(
-            callId = outgoingInviteCallId,
-            outgoingDialogNextCseq = outgoingDialogNextCseq,
-        )
+        pendingOutgoingInvite = prepared.pendingInvite
+        return prepared.sendState
     }
 
 
@@ -5434,18 +4532,17 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         rtpSocket: DatagramSocket,
         body: ByteArray,
     ) {
-        val outgoingInviteCallId = msg.headers["call-id"]!![0]
-        Rlog.w(
-            TAG,
-            "Outgoing INVITE send context " +
-                imsDualSimDebugContext(
-                    "callId=$outgoingInviteCallId cseq=${msg.headers["cseq"]?.getOrNull(0)} " +
-                        "to=$destination raw=$phoneNumber normalized=$normalizedPhoneNumber " +
-                        "rtp=${rtpSocket.localAddress}:${rtpSocket.localPort} sdpBytes=${body.size}"
-                ),
+        SipOutgoingInviteInitialSend.write(
+            logTag = TAG,
+            msg = msg,
+            phoneNumber = phoneNumber,
+            normalizedPhoneNumber = normalizedPhoneNumber,
+            destination = destination,
+            rtpSocket = rtpSocket,
+            body = body,
+            debugContext = { context -> imsDualSimDebugContext(context) },
+            writeBytes = { bytes -> writeSipBytesWithFlush(socket.gWriter(), "SipHandler msg", bytes) },
         )
-        Rlog.d(TAG, "Sending $msg")
-        writeSipBytesWithFlush(socket.gWriter(), "SipHandler msg", msg.toByteArray())
     }
 
 
@@ -5806,149 +4903,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
 
 
-    private fun lookInDialogInviteTrackMatching(
-        attributes: List<String>,
-        codec: String,
-        notAdditional: String = "",
-    ): Pair<Int, String>? {
-        val maps = attributes.filter { it.startsWith("rtpmap") && it.contains(codec) }
-        val matches = maps.map { m ->
-            val track = m.split("[: ]+".toRegex())[1].toInt()
-            Pair(track, m)
-        }
-        val sorted = if (matches.size > 1) {
-            matches.sortedBy { m ->
-                val fmtp = attributes.firstOrNull { it.startsWith("fmtp:${m.first}") }.orEmpty()
-                when {
-                    codec.startsWith("AMR") && fmtp.isEmpty() -> 100
-                    notAdditional.isNotEmpty() && fmtp.contains(notAdditional) -> 90
-                    else -> 10
-                }
-            }
-        } else {
-            matches
-        }
-        Rlog.d(TAG, "In-dialog INVITE matching $codec, got $sorted")
-        return sorted.firstOrNull()
-    }
-
-    private fun inDialogInviteTrackRequirements(
-        attributes: List<String>,
-        track: Int,
-    ): String? {
-        return attributes.firstOrNull { it.startsWith("fmtp:$track") }
-    }
-
-
-    private data class InDialogInviteSdpOffer(
-        val sdp: List<String>,
-        val rtpRemoteAddr: InetAddress,
-        val rtpRemotePort: Int,
-        val attributes: List<String>,
-    )
-
-    private fun parseInDialogInviteSdpOffer(
-        request: SipRequest,
-        callId: String,
-        cseq: String,
-    ): InDialogInviteSdpOffer? {
-        val sdp = request.body.toString(Charsets.UTF_8).split("[\r\n]+".toRegex()).toList()
-        Rlog.d(TAG, "Handling in-dialog INVITE: callId=$callId cseq=$cseq sdp=$sdp")
-
-        fun sdpElement(command: String): String? {
-            val v = sdp.firstOrNull { it.startsWith("$command=") } ?: return null
-            return v.substring(2)
-        }
-
-        val sdpConnectionData = sdpElement("c") ?: return null
-        val sdpMedia = sdpElement("m") ?: return null
-        val rtpRemote = sdpConnectionData.split(" ").getOrNull(2) ?: return null
-        val rtpRemoteAddr = InetAddress.getByName(rtpRemote)
-        val rtpRemotePort = sdpMedia.split(" ").getOrNull(1)?.toIntOrNull() ?: return null
-        val attributes = sdp.filter { it.startsWith("a=") }.map { it.substring(2) }
-        SipAudioCodecSdpLogger.logRemoteAudioCodecCandidates(
-            tag = TAG,
-            context = "remote SDP ${request.method} callId=${request.callIdOrEmpty()}",
-            sdp = sdp,
-        )
-
-        return InDialogInviteSdpOffer(
-            sdp = sdp,
-            rtpRemoteAddr = rtpRemoteAddr,
-            rtpRemotePort = rtpRemotePort,
-            attributes = attributes,
-        )
-    }
-
-
-    private fun buildInDialogInviteAnswerSdp(
-        call: Call,
-        attributes: List<String>,
-        sdp: List<String>,
-        selectedAudioCodec: NegotiatedAudioCodec,
-        amrTrack: Int,
-        amrTrackDesc: String,
-        amrFmtpAnswer: String,
-        dtmfTrack: Int,
-        dtmfTrackDesc: String,
-    ): ByteArray {
-        val remotePtime = attributes.firstOrNull { it.startsWith("ptime:") } ?: "ptime:20"
-        val remoteMaxptime = attributes.firstOrNull { it.startsWith("maxptime:") } ?: "maxptime:20"
-        val allTracks = listOf(amrTrack, dtmfTrack)
-        val sdpBandwidthAs = SipAudioCodecNegotiator.sdpBandwidthAsKbps(selectedAudioCodec)
-        val remoteBandwidthLines = sdp
-            .filter { it.startsWith("b=", ignoreCase = true) }
-            .map { it.substring(2).trim() }
-            .filter { it.startsWith("AS:", ignoreCase = true) }
-        val answerBandwidthLines = if (remoteBandwidthLines.isNotEmpty()) {
-            remoteBandwidthLines
-        } else {
-            listOf("AS:$sdpBandwidthAs")
-        }
-        val remoteDirection = attributes.firstOrNull {
-            it == "sendrecv" || it == "sendonly" || it == "recvonly" || it == "inactive"
-        }
-        val answerDirection = when (remoteDirection) {
-            "sendonly" -> "recvonly"
-            "recvonly" -> "sendonly"
-            "inactive" -> "inactive"
-            "sendrecv" -> "sendrecv"
-            else -> null
-        }
-        Rlog.d(
-            TAG,
-            "Conservative in-dialog INVITE SDP answer: " +
-                "bandwidth=$answerBandwidthLines ptime=$remotePtime maxptime=$remoteMaxptime " +
-                "remoteDirection=$remoteDirection answerDirection=$answerDirection"
-        )
-        val localSdpSessionVersion = call.localSdpVersion.incrementAndGet().coerceAtLeast(3)
-        Rlog.d(
-            TAG,
-            "In-dialog INVITE SDP answer version: callId=${call.callIdOrEmpty()} version=$localSdpSessionVersion",
-        )
-        val ipType = if (socket.gLocalAddr() is Inet6Address) "IP6" else "IP4"
-        val answerSdpLines = mutableListOf(
-            "v=0",
-            "o=- 1 $localSdpSessionVersion IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "s=-",
-            "c=IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "t=0 0",
-            "m=audio ${call.rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}",
-        )
-        answerBandwidthLines.forEach { answerSdpLines += "b=$it" }
-        answerSdpLines += listOf(
-            "a=$amrTrackDesc",
-            "a=$remotePtime",
-            "a=$remoteMaxptime",
-            "a=$dtmfTrackDesc",
-            "a=$amrFmtpAnswer",
-            "a=fmtp:$dtmfTrack 0-15",
-        )
-        answerDirection?.let { answerSdpLines += "a=$it" }
-        return answerSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
-    }
-
-
     private fun updateCurrentCallFromInDialogInviteSdp(
         call: Call,
         request: SipRequest,
@@ -5960,87 +4914,60 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         rtpRemoteAddr: InetAddress,
         rtpRemotePort: Int,
     ): Call {
-        val updatedCall = call.copy(
+        val updateState = SipInDialogInvite.callUpdateState(
+            request = request,
+            answerSdp = answerSdp,
             amrTrack = amrTrack,
             amrTrackDesc = amrTrackDesc,
             dtmfTrack = dtmfTrack,
             dtmfTrackDesc = dtmfTrackDesc,
-            sdp = answerSdp,
             rtpRemoteAddr = rtpRemoteAddr,
             rtpRemotePort = rtpRemotePort,
-            remoteContact = request.headers["contact"]?.getOrNull(0)
-                ?.let { extractDestinationFromContact(it) }
-                ?: call.remoteContact,
+            fallbackRemoteContact = call.remoteContact,
+            extractDestinationFromContact = { contact -> extractDestinationFromContact(contact) },
+        )
+        val updatedCall = call.copy(
+            amrTrack = updateState.amrTrack,
+            amrTrackDesc = updateState.amrTrackDesc,
+            dtmfTrack = updateState.dtmfTrack,
+            dtmfTrackDesc = updateState.dtmfTrackDesc,
+            sdp = updateState.answerSdp,
+            rtpRemoteAddr = updateState.rtpRemoteAddr,
+            rtpRemotePort = updateState.rtpRemotePort,
+            remoteContact = updateState.remoteContact,
         )
         currentCall = updatedCall
         return updatedCall
     }
 
 
-    private fun inDialogInviteSessionTimerHeaders(request: SipRequest): Map<String, List<String>> {
-        val requestSessionExpires = request.headers["session-expires"]?.getOrNull(0)
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-        val requestMinSe = request.headers["min-se"]?.getOrNull(0)
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-        val inDialogSessionTimerHeaders = mutableMapOf<String, List<String>>()
-        requestSessionExpires?.let { inDialogSessionTimerHeaders["session-expires"] = listOf(it) }
-        requestMinSe?.let { inDialogSessionTimerHeaders["min-se"] = listOf(it) }
-        Rlog.d(
-            TAG,
-            "In-dialog INVITE session timer response headers: " +
-                "Session-Expires=$requestSessionExpires Min-SE=$requestMinSe"
-        )
-        return inDialogSessionTimerHeaders
-    }
-
-    private fun okInDialogInviteWithSdpResponse(
-        request: SipRequest,
-        call: Call,
-        answerSdp: ByteArray,
-        inDialogSessionTimerHeaders: Map<String, List<String>>,
-    ): SipResponse {
-        val responseHeaders = responseHeadersFromRequest(
-            request,
-            extra = """
-                Contact: ${call.callHeaders["contact"]!!.first()}
-                Supported: timer
-                Content-Type: application/sdp
-            """.toSipHeadersMap() + inDialogSessionTimerHeaders
-        )
-        val response = SipResponse(
-            statusCode = 200,
-            statusString = "OK",
-            headersParam = responseHeaders,
-            body = answerSdp,
-        )
-        Rlog.d(TAG, "Replying to in-dialog INVITE without creating a new incoming call: $response")
-        return response
-    }
-
     private fun handleInDialogInvite(request: SipRequest, call: Call, responseWriter: OutputStream): Int {
         val callId = request.callIdOrEmpty()
         val cseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
-        val offer = parseInDialogInviteSdpOffer(
+        val offer = SipInDialogInvite.parseSdpOffer(
             request = request,
             callId = callId,
             cseq = cseq,
+            logTag = TAG,
         ) ?: return 488
         val sdp = offer.sdp
         val rtpRemoteAddr = offer.rtpRemoteAddr
         val rtpRemotePort = offer.rtpRemotePort
         val attributes = offer.attributes
 
-        val selectedAudioCodec = call.audioCodec
-        val (amrTrack, amrTrackDesc) =
-            lookInDialogInviteTrackMatching(attributes, SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec), notAdditional = "octet-align=1") ?: return 488
-        val (dtmfTrack, dtmfTrackDesc) =
-            lookInDialogInviteTrackMatching(attributes, SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec)) ?: return 488
-        val amrFmtpAnswer =
-            inDialogInviteTrackRequirements(attributes, amrTrack) ?: SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(amrTrack, selectedAudioCodec)
-        val answerSdp = buildInDialogInviteAnswerSdp(
-            call = call,
+        val mediaSelection = SipInDialogInvite.selectMedia(
+            attributes = attributes,
+            selectedAudioCodec = call.audioCodec,
+            logTag = TAG,
+        ) ?: return 488
+        val selectedAudioCodec = mediaSelection.selectedAudioCodec
+        val amrTrack = mediaSelection.amrTrack
+        val amrTrackDesc = mediaSelection.amrTrackDesc
+        val amrFmtpAnswer = mediaSelection.amrFmtpAnswer
+        val dtmfTrack = mediaSelection.dtmfTrack
+        val dtmfTrackDesc = mediaSelection.dtmfTrackDesc
+        val localSdpSessionVersion = call.localSdpVersion.incrementAndGet().coerceAtLeast(3)
+        val answerSdp = SipInDialogInvite.buildAnswerSdp(
             attributes = attributes,
             sdp = sdp,
             selectedAudioCodec = selectedAudioCodec,
@@ -6049,6 +4976,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             amrFmtpAnswer = amrFmtpAnswer,
             dtmfTrack = dtmfTrack,
             dtmfTrackDesc = dtmfTrackDesc,
+            localSdpSessionVersion = localSdpSessionVersion,
+            callId = call.callIdOrEmpty(),
+            localAddr = socket.gLocalAddr(),
+            localRtpPort = call.rtpSocket.localPort,
+            logTag = TAG,
         )
 
 
@@ -6063,17 +4995,24 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             rtpRemoteAddr = rtpRemoteAddr,
             rtpRemotePort = rtpRemotePort,
         )
-        val inDialogSessionTimerHeaders = inDialogInviteSessionTimerHeaders(request)
-
-        val response = okInDialogInviteWithSdpResponse(
+        val inDialogSessionTimerHeaders = SipInDialogInvite.sessionTimerHeaders(
             request = request,
-            call = call,
+            logTag = TAG,
+        )
+
+        val response = SipInDialogInvite.okResponseWithSdp(
+            request = request,
+            contact = call.callHeaders["contact"]!!.first(),
             answerSdp = answerSdp,
             inDialogSessionTimerHeaders = inDialogSessionTimerHeaders,
+            logTag = TAG,
         )
 
 
-        synchronized(responseWriter) { responseWriter.write(response.toByteArray()) }
+        SipInDialogInvite.writeOkResponse(
+            responseWriter = responseWriter,
+            response = response,
+        )
         return 0
     }
 
@@ -6082,28 +5021,18 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         incomingCallId: String,
         request: SipRequest,
     ): Int? {
-        if (!wasRecentlyTerminatedIncomingCall(incomingCallId)) return null
-
-        val incomingCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
         val maybeCurrentCall = currentCall
-        val isAcceptedPreAckCurrentCall =
-            maybeCurrentCall != null &&
-                !maybeCurrentCall.outgoing &&
-                maybeCurrentCall.callIdOrEmpty() == incomingCallId &&
-                (incomingAcceptedAwaitingAck.get() || incomingFinalResponseSent.get()) &&
-                incomingHangupAfterAck.get()
-
-        if (!isAcceptedPreAckCurrentCall) {
-            Rlog.w(TAG, "Rejecting duplicate incoming INVITE for recently terminated Call-ID: callId=$incomingCallId cseq=$incomingCseq")
-            return 486
-        }
-
-        Rlog.w(
-            TAG,
-            "Allowing duplicate incoming INVITE for accepted pre-ACK call despite recently terminated marker: " +
-                "callId=$incomingCallId cseq=$incomingCseq awaitingAck=${incomingAcceptedAwaitingAck.get()}",
+        return SipIncomingInviteDialogSetup.rejectRecentlyTerminatedInviteIfNeeded(
+            logTag = TAG,
+            incomingCallId = incomingCallId,
+            request = request,
+            wasRecentlyTerminated = wasRecentlyTerminatedIncomingCall(incomingCallId),
+            currentCallId = maybeCurrentCall?.callIdOrEmpty(),
+            currentCallOutgoing = maybeCurrentCall?.outgoing,
+            incomingAcceptedAwaitingAck = incomingAcceptedAwaitingAck.get(),
+            incomingFinalResponseSent = incomingFinalResponseSent.get(),
+            incomingHangupAfterAck = incomingHangupAfterAck.get(),
         )
-        return null
     }
 
 
@@ -6119,7 +5048,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         val incomingCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
         val duplicateAnswered = incomingFinalResponseSent.get() || incomingAcceptedAwaitingAck.get() || callStarted.get()
-        val refreshedHeaders = responseHeadersFromRequest(
+        val refreshedHeaders = SipDialogHeaderBuilder.responseHeadersFromRequest(
             request = request,
             toOverride = existingCall.callHeaders["to"],
         )
@@ -6131,10 +5060,13 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         Rlog.w(
             TAG,
-            "Refreshing duplicate incoming INVITE for existing incoming dialog: " +
-                "callId=$incomingCallId cseq=$incomingCseq " +
-                "finalResponseSent=${incomingFinalResponseSent.get()} " +
-                "awaitingAck=${incomingAcceptedAwaitingAck.get()} callStarted=${callStarted.get()}",
+            SipIncomingInviteRequestFlowLogs.duplicateIncomingInviteRefreshLog(
+                callId = incomingCallId,
+                cseq = incomingCseq,
+                finalResponseSent = incomingFinalResponseSent.get(),
+                awaitingAck = incomingAcceptedAwaitingAck.get(),
+                callStarted = callStarted.get(),
+            ),
         )
 
         if (duplicateAnswered) {
@@ -6151,44 +5083,28 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             }
             currentCall = duplicateFinalCall
 
-            val duplicateFinalSdpHeaders = if (!duplicateOmitFinalSdp) {
-                (
-                    "Content-Type: application/sdp\n" +
-                        "Content-Length: ${duplicateFinalBody.size}\n"
-                ).toSipHeadersMap()
-            } else {
-                "Content-Length: 0".toSipHeadersMap()
-            }
-            val duplicateFinalHeaders =
-                duplicateFinalCall.callHeaders -
-                    "rseq" -
-                    "security-verify" -
-                    "p-access-network-info" -
-                    "content-type" -
-                    "content-length" +
-                    (
-                        "Session-Expires: 1800;refresher=uas\n" +
-                            "Contact: ${duplicateFinalCall.callHeaders["contact"]!!.first()}\n"
-                    ).toSipHeadersMap() +
-                    duplicateFinalSdpHeaders
-
-            val duplicateFinalResponse = SipResponse(
-                statusCode = 200,
-                statusString = "OK",
-                headersParam = duplicateFinalHeaders,
+            val duplicateFinalResponse = SipIncomingInviteFinalResponses.duplicateFinalResponse(
+                callHeaders = duplicateFinalCall.callHeaders,
+                contact = duplicateFinalCall.callHeaders["contact"]!!.first(),
                 body = duplicateFinalBody,
-                autofill = false,
+                omitFinalSdp = duplicateOmitFinalSdp,
             )
             val duplicateFinalBytes = duplicateFinalResponse.toByteArray()
             Rlog.w(
                 TAG,
-                "Re-sending final 200 OK on duplicate incoming INVITE transaction: " +
-                    "callId=$incomingCallId cseq=$incomingCseq bytes=${duplicateFinalBytes.size}",
+                SipIncomingInviteFinalResponses.duplicateFinalResponseResendLog(
+                    incomingCallId = incomingCallId,
+                    incomingCseq = incomingCseq,
+                    responseBytesSize = duplicateFinalBytes.size,
+                ),
             )
             if (writeSipBytes(
                     incomingResponseWriter,
                     duplicateFinalBytes,
-                    "duplicate incoming INVITE final 200 OK callId=$incomingCallId cseq=$incomingCseq",
+                    SipIncomingInviteFinalResponses.duplicateFinalResponseWriteContext(
+                        incomingCallId = incomingCallId,
+                        incomingCseq = incomingCseq,
+                    ),
                 )
             ) {
                 incomingFinalResponseSent.set(true)
@@ -6196,8 +5112,10 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             } else {
                 Rlog.w(
                     TAG,
-                    "Failed to send final 200 OK on duplicate incoming INVITE transaction: " +
-                        "callId=$incomingCallId cseq=$incomingCseq",
+                    SipIncomingInviteFinalResponses.duplicateFinalResponseFailureLog(
+                        incomingCallId = incomingCallId,
+                        incomingCseq = incomingCseq,
+                    ),
                 )
             }
             return 0
@@ -6212,34 +5130,17 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         incomingCallId: String,
         existingCall: Call?,
     ): Int? {
-        val activeCallId = existingCall?.callHeaders?.get("call-id")?.getOrNull(0)
-        if (existingCall != null && activeCallId != incomingCallId) {
-            val activeDirection = if (existingCall.outgoing) "outgoing" else "incoming"
-            val incomingCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
-            Rlog.w(
-                TAG,
-                "Rejecting second incoming INVITE while busy: " +
-                    "callId=$incomingCallId cseq=$incomingCseq " +
-                    "activeCallId=$activeCallId activeDirection=$activeDirection"
-            )
-            rememberTerminatedIncomingCall(incomingCallId, "busy reject")
-            return 486
-        }
+        val decision = SipIncomingInviteDialogSetup.rejectWhileBusyOrOutgoingPending(
+            logTag = TAG,
+            request = request,
+            incomingCallId = incomingCallId,
+            activeCallId = existingCall?.callHeaders?.get("call-id")?.getOrNull(0),
+            activeCallOutgoing = existingCall?.outgoing,
+            pendingOutgoingCallId = pendingOutgoingInvite?.callId,
+        ) ?: return null
 
-        val pendingOutgoingCallId = pendingOutgoingInvite?.callId
-        if (pendingOutgoingCallId != null && pendingOutgoingCallId != incomingCallId) {
-            val incomingCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
-            Rlog.w(
-                TAG,
-                "Rejecting incoming INVITE while outgoing INVITE is pending: " +
-                    "callId=$incomingCallId cseq=$incomingCseq " +
-                    "pendingOutgoingCallId=$pendingOutgoingCallId"
-            )
-            rememberTerminatedIncomingCall(incomingCallId, "outgoing pending reject")
-            return 486
-        }
-
-        return null
+        rememberTerminatedIncomingCall(incomingCallId, decision.terminatedReason)
+        return decision.statusCode
     }
 
 
@@ -6260,326 +5161,50 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         request: SipRequest,
         incomingResponseWriter: OutputStream,
     ) {
-        val trying = SipResponse(
-            statusCode = 100,
-            statusString = "Trying",
-            headersParam = responseHeadersFromRequest(
-                request,
-                extra = "Content-Length: 0".toSipHeadersMap(),
-            ),
-            autofill = false
-        )
-        Rlog.d(TAG, "Sending explicit 100 Trying on incoming request flow: $trying")
+        val trying = SipIncomingInviteDialogSetup.explicitTryingResponse(request)
+        Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.explicitTryingLog(trying))
         synchronized(incomingResponseWriter) { incomingResponseWriter.write(trying.toByteArray()) }
     }
 
 
-    private data class IncomingInviteOffer(
-        val callerNumber: String,
-        val sdp: List<String>,
-        val rtpRemoteAddr: InetAddress,
-        val rtpRemotePort: String,
-        val attributes: List<String>,
-        val peerSupportsEarlyMedia: Boolean,
-        val callerSupportsPrecondition: Boolean,
-        val sendReliable183: Boolean,
-        val remoteMaxptime: String,
-        val selectedAudioCodec: NegotiatedAudioCodec,
-        val amrTrack: Int,
-        val amrTrackDesc: String,
-        val amrFmtpAnswer: String,
-        val dtmfTrack: Int,
-        val dtmfTrackDesc: String,
-        val allTracks: List<Int>,
-        val sdpBandwidthAs: Int,
-        val owner: String,
-    )
 
 
-    private data class IncomingInviteSdpBasics(
-        val sdp: List<String>,
-        val attributes: List<String>,
-        val rtpRemoteAddr: InetAddress,
-        val rtpRemotePort: String,
-    )
-
-    private fun parseIncomingInviteSdpBasics(
-        request: SipRequest,
-    ): IncomingInviteSdpBasics {
-        val sdp = request.body.toString(Charsets.UTF_8).split("[\r\n]+".toRegex()).toList()
-        Rlog.d(TAG, "Split SDP into $sdp")
-        fun sdpElement(command: String): String? {
-            val v = sdp.firstOrNull { it.startsWith("$command=")} ?: return null
-            return v.substring(2)
-        }
-        val sdpConnectionData = sdpElement("c")
-        val sdpOrigin = sdpElement("o")
-        val sdpSessionName = sdpElement("s")
-        val sdpTiming = sdpElement("t")
-        val sdpBandwidth = sdpElement("b")
-        val sdpMedia = sdpElement("m")
-
-        Rlog.d(TAG, "Got sdpTiming $sdpTiming")
-
-        if (sdpTiming != "0 0")
-            Rlog.d(TAG, "Uh-oh, unknown timing mode")
 
 
-        val rtpRemote = sdpConnectionData!!.split(" ")[2] //c=IN IP6 xxx
-        val rtpRemoteAddr = InetAddress.getByName(rtpRemote)
-        val rtpRemotePort = sdpMedia!!.split(" ")[1] //m=audio 30798 RTP/AVP 96 97 98 8 18 101 100 99
-
-        val attributes = sdp.filter { it.startsWith("a=") }.map { it.substring(2)}
-        SipAudioCodecSdpLogger.logRemoteAudioCodecCandidates(
-            tag = TAG,
-            context = "remote SDP ${request.method} callId=${request.callIdOrEmpty()}",
-            sdp = sdp,
-        )
-
-        return IncomingInviteSdpBasics(
-            sdp = sdp,
-            attributes = attributes,
-            rtpRemoteAddr = rtpRemoteAddr,
-            rtpRemotePort = rtpRemotePort,
-        )
-    }
 
 
-    private data class IncomingInviteCapabilities(
-        val peerSupportsEarlyMedia: Boolean,
-        val callerSupportsPrecondition: Boolean,
-        val sendReliable183: Boolean,
-        val remoteMaxptime: String,
-    )
-
-    private fun parseIncomingInviteCapabilities(
-        request: SipRequest,
-        attributes: List<String>,
-    ): IncomingInviteCapabilities {
-        val peerSupportsEarlyMedia = request.headers["p-early-media"]?.isNotEmpty() == true
-        val callerCapabilityHeaders =
-            request.headers["supported"].orEmpty() + request.headers["require"].orEmpty()
-        val callerSupports100Rel = callerCapabilityHeaders
-            .any { it.contains("100rel", ignoreCase = true) }
-        val callerSupportsPreconditionHeader = callerCapabilityHeaders
-            .any { it.contains("precondition", ignoreCase = true) }
-        val incomingOfferHasPrecondition = attributes.any { attr ->
-            attr.startsWith("curr:qos", ignoreCase = true) ||
-                attr.startsWith("des:qos", ignoreCase = true) ||
-                attr.startsWith("conf:qos", ignoreCase = true)
-        }
-        val incomingOfferIsInactive = attributes.any { it.equals("inactive", ignoreCase = true) }
-        val callerSupportsPrecondition = callerSupportsPreconditionHeader || incomingOfferHasPrecondition
-        // Some carriers send incoming VoLTE as inactive media with mandatory QoS
-        // preconditions and will not open downlink RTP until the provisional SDP is
-        // acknowledged with PRACK. Keep the old plain-180 path for simple incoming
-        // offers because at least one tested network did not PRACK reliable 183.
-        val sendReliable183 =
-            callerSupports100Rel &&
-                callerSupportsPrecondition &&
-                incomingOfferHasPrecondition &&
-                incomingOfferIsInactive
-        val remoteMaxptime = attributes.firstOrNull { it.startsWith("maxptime:") } ?: "maxptime:20"
-        Rlog.d(
-            TAG,
-            "Incoming early-media support=$peerSupportsEarlyMedia " +
-                "sendReliable183=$sendReliable183 " +
-                "supports100rel=$callerSupports100Rel " +
-                "callerSupportsPrecondition=$callerSupportsPrecondition " +
-                "headerPrecondition=$callerSupportsPreconditionHeader " +
-                "sdpPrecondition=$incomingOfferHasPrecondition " +
-                "inactiveOffer=$incomingOfferIsInactive " +
-                "remoteMaxptime=$remoteMaxptime",
-        )
-
-        return IncomingInviteCapabilities(
-            peerSupportsEarlyMedia = peerSupportsEarlyMedia,
-            callerSupportsPrecondition = callerSupportsPrecondition,
-            sendReliable183 = sendReliable183,
-            remoteMaxptime = remoteMaxptime,
-        )
-    }
 
 
-    private data class IncomingInviteMediaSelection(
-        val selectedAudioCodec: NegotiatedAudioCodec,
-        val amrTrack: Int,
-        val amrTrackDesc: String,
-        val amrFmtpAnswer: String,
-        val dtmfTrack: Int,
-        val dtmfTrackDesc: String,
-        val allTracks: List<Int>,
-        val sdpBandwidthAs: Int,
-    )
-
-    private fun selectIncomingInviteMedia(
-        sdp: List<String>,
-        attributes: List<String>,
-        incomingCallId: String,
-    ): IncomingInviteMediaSelection? {
-        fun lookTrackMatching(codec: String, additional: String = "", notAdditional: String = ""): Pair<Int,String>? {
-            //TODO: also match on fmtp
-            val maps = attributes.filter { it.startsWith("rtpmap") && it.contains(codec) }
-            val matches = maps.map { m ->
-                val track = m.split("[: ]+".toRegex())[1].toInt()
-                val desc = m
-                Pair(track, desc)
-            }
-            Rlog.d(TAG, "Matching $codec, got $matches")
-            val matches2 = if(matches.size > 1) {
-                matches.sortedBy { m ->
-                    val fmtp = attributes.firstOrNull { it.startsWith("fmtp:${m.first}") }.orEmpty()
-                    Rlog.d(TAG, "Matching $codec, for match $m got fmtp $fmtp")
-                    when {
-                        // For AMR, do not prefer an rtpmap-only payload when valid fmtp payloads exist.
-                        codec.startsWith("AMR") && fmtp.isEmpty() -> 100
-
-                        // This stack currently sends bandwidth-efficient AMR, so avoid octet-align=1.
-                        notAdditional.isNotEmpty() && fmtp.contains(notAdditional) -> 90
-
-                        // Optional positive preference for codecs/callers where we have one.
-                        additional.isNotEmpty() && fmtp.contains(additional) -> 0
-
-                        else -> 10
-                    }
-                }
-            } else {
-                matches
-            }
-            Rlog.d(TAG, "Matching2 $codec, got $matches2")
-            return matches2.firstOrNull()
-        }
-
-        fun trackRequirements(track: Int): String? {
-            return attributes.firstOrNull() { it.startsWith("fmtp:$track") }
-        }
-
-        val selectedAudioCodec = SipAudioCodecNegotiator.selectIncomingSpeechCodecFromOffer(
-            logTag = TAG,
-            sdp = sdp,
-            context = "incoming INVITE callId=$incomingCallId",
-            amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
-        )
-
-        val (amrTrack, amrTrackDesc) = lookTrackMatching(
-            SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec),
-            additional = "",
-            notAdditional = "octet-align=1",
-        ) ?: return null
-        val amrTrackRequirements = trackRequirements(amrTrack)
-        val amrFmtpAnswer = amrTrackRequirements ?: SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(amrTrack, selectedAudioCodec)
-
-        val (dtmfTrack, dtmfTrackDesc) =
-            lookTrackMatching(SipAudioCodecNegotiator.telephoneEventRtpmapName(selectedAudioCodec)) ?: return null
-
-        val allTracks = listOf(amrTrack, dtmfTrack)
-        val sdpBandwidthAs = SipAudioCodecNegotiator.sdpBandwidthAsKbps(selectedAudioCodec)
-
-        return IncomingInviteMediaSelection(
-            selectedAudioCodec = selectedAudioCodec,
-            amrTrack = amrTrack,
-            amrTrackDesc = amrTrackDesc,
-            amrFmtpAnswer = amrFmtpAnswer,
-            dtmfTrack = dtmfTrack,
-            dtmfTrackDesc = dtmfTrackDesc,
-            allTracks = allTracks,
-            sdpBandwidthAs = sdpBandwidthAs,
-        )
-    }
 
 
-    private fun buildIncomingInviteOffer(
-        request: SipRequest,
-        callerNumber: String,
-        sdpBasics: IncomingInviteSdpBasics,
-        capabilities: IncomingInviteCapabilities,
-        mediaSelection: IncomingInviteMediaSelection,
-    ): IncomingInviteOffer {
-        // destination is sip:<owner>@realm, extract owner
-        val owner = request.destination.substringAfter("sip:").substringBefore("@")
 
-        return IncomingInviteOffer(
-            callerNumber = callerNumber,
-            sdp = sdpBasics.sdp,
-            rtpRemoteAddr = sdpBasics.rtpRemoteAddr,
-            rtpRemotePort = sdpBasics.rtpRemotePort,
-            attributes = sdpBasics.attributes,
-            peerSupportsEarlyMedia = capabilities.peerSupportsEarlyMedia,
-            callerSupportsPrecondition = capabilities.callerSupportsPrecondition,
-            sendReliable183 = capabilities.sendReliable183,
-            remoteMaxptime = capabilities.remoteMaxptime,
-            selectedAudioCodec = mediaSelection.selectedAudioCodec,
-            amrTrack = mediaSelection.amrTrack,
-            amrTrackDesc = mediaSelection.amrTrackDesc,
-            amrFmtpAnswer = mediaSelection.amrFmtpAnswer,
-            dtmfTrack = mediaSelection.dtmfTrack,
-            dtmfTrackDesc = mediaSelection.dtmfTrackDesc,
-            allTracks = mediaSelection.allTracks,
-            sdpBandwidthAs = mediaSelection.sdpBandwidthAs,
-            owner = owner,
-        )
-    }
 
     private fun parseIncomingInviteOffer(
         request: SipRequest,
         incomingCallId: String,
-    ): IncomingInviteOffer? {
-        val f = request.headers["from"]
-        val callerNumber = extractCallerNumberFromHeader(f!![0]!!)
-        Rlog.d(TAG, "Incoming call from $callerNumber rawFrom=${f[0]} callId=$incomingCallId hasIncomingResponseWriter=${requestWriters.containsKey(incomingCallId)}")
-
-        // We'll have three states:
-        // - 100 Trying (this will be done by returning 100 in this function)
-        // - 183 Session Progress network-wise we're ready to receive data
-        // - 180 Ringing Notification's AudioTrack is playing, the user can hear its phone -- Note: Ringing doesn't give SDP
-        // - 200 User has accepted the call
-
-        val incomingSdpBasics = parseIncomingInviteSdpBasics(request)
-
-        val incomingCapabilities = parseIncomingInviteCapabilities(
+    ): IncomingInviteOffer? =
+        SipIncomingInviteOfferParser.parse(
             request = request,
-            attributes = incomingSdpBasics.attributes,
-        )
-
-        val incomingMediaSelection = selectIncomingInviteMedia(
-            sdp = incomingSdpBasics.sdp,
-            attributes = incomingSdpBasics.attributes,
             incomingCallId = incomingCallId,
-        ) ?: return null
-
-        return buildIncomingInviteOffer(
-            request = request,
-            callerNumber = callerNumber,
-            sdpBasics = incomingSdpBasics,
-            capabilities = incomingCapabilities,
-            mediaSelection = incomingMediaSelection,
+            logTag = TAG,
+            hasIncomingResponseWriter = requestWriters.containsKey(incomingCallId),
+            amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
+            extractCallerNumberFromHeader = { header -> extractCallerNumberFromHeader(header) },
         )
-    }
 
 
     private fun createIncomingInviteRtpSocket(
         rtpRemoteAddr: InetAddress,
         rtpRemotePort: String,
-    ): DatagramSocket? {
-        val rtpSocket = try {
-            DatagramSocket(0, localAddr)
-        } catch (t: Throwable) {
-            Rlog.e(TAG, "Failed to bind incoming RTP socket to $localAddr; IMS address is likely stale", t)
-            reconnectIms("incoming RTP bind failed for localAddr=$localAddr")
-            return null
-        }
-        try {
-            network.bindSocket(rtpSocket)
-            rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
-        } catch (t: Throwable) {
-            Rlog.e(TAG, "Failed to bind/connect incoming RTP socket", t)
-            try { rtpSocket.close() } catch (_: Throwable) {}
-            reconnectIms("incoming RTP bind/connect failed")
-            return null
-        }
-        Rlog.d(TAG, "RTP socket created: local=${rtpSocket.localAddress}:${rtpSocket.localPort}, remote=${rtpSocket.inetAddress}:${rtpSocket.port}")
-        return rtpSocket
-    }
+    ): DatagramSocket? =
+        SipIncomingInviteDialogSetup.createIncomingRtpSocket(
+            logTag = TAG,
+            localAddr = localAddr,
+            rtpRemoteAddr = rtpRemoteAddr,
+            rtpRemotePort = rtpRemotePort,
+            bindSocket = { rtpSocket -> network.bindSocket(rtpSocket) },
+            reconnectIms = { reason -> reconnectIms(reason) },
+        )
 
 
     private fun incomingInviteDialogContact(
@@ -6587,147 +5212,33 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         owner: String,
         incomingCallId: String,
     ): String {
-        val local =
-            if(socket.gLocalAddr() is Inet6Address)
-                "[${socket.gLocalAddr().hostAddress}]:${serverSocket.localPort}"
-            else
-                "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
-        val incomingDialogTransport = request.headers["via"]
-            ?.firstOrNull()
-            ?.substringAfter("SIP/2.0/", "")
-            ?.substringBefore(" ")
-            ?.trim()
-            ?.lowercase()
-            ?.takeIf { it == "udp" || it == "tcp" }
-            ?: SipContactHeaders.transport(socket)
-        val dialogContact = SipContactHeaders.mmtelContact(
-            userPart = owner,
+        val local = SipIncomingInviteDialogSetup.localDialogEndpoint(
+            localHost = socket.gLocalAddr().hostAddress,
+            isIpv6 = socket.gLocalAddr() is Inet6Address,
+            port = serverSocket.localPort,
+        )
+        return SipIncomingInviteDialogSetup.buildDialogContact(
+            logTag = TAG,
+            request = request,
+            owner = owner,
+            incomingCallId = incomingCallId,
             localEndpoint = local,
-            transport = incomingDialogTransport,
-            sipInstance = SipContactHeaders.sipInstanceFromImei(imei),
+            fallbackTransport = SipContactHeaders.transport(socket),
+            imei = imei,
         )
-        Rlog.d(
-            TAG,
-            "Incoming dialog Contact: $dialogContact " +
-                "transport=$incomingDialogTransport callId=$incomingCallId",
-        )
-        return dialogContact
-    }
-
-
-    private data class IncomingInviteSdpAnswer(
-        val reliableSequence: Int,
-        val body: ByteArray,
-    )
-
-    private fun buildIncomingInviteSdpAnswer(
-        owner: String,
-        rtpSocket: DatagramSocket,
-        sdpBandwidthAs: Int,
-        allTracks: List<Int>,
-        amrTrackDesc: String,
-        remoteMaxptime: String,
-        dtmfTrackDesc: String,
-        amrFmtpAnswer: String,
-        dtmfTrack: Int,
-        callerSupportsPrecondition: Boolean,
-        sendReliable183: Boolean,
-        incomingCallId: String,
-    ): IncomingInviteSdpAnswer {
-        val mySeqCounter = reliableSequenceCounter++
-        val ipType = if(socket.gLocalAddr() is Inet6Address) "IP6" else "IP4"
-        val sdpLines = mutableListOf(
-            "v=0",
-            "o=$owner 1 2 IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "s=phh voice call",
-            "c=IN $ipType ${socket.gLocalAddr().hostAddress}",
-            "b=AS:$sdpBandwidthAs",
-            "b=RS:0",
-            "b=RR:0",
-            "t=0 0",
-            "m=audio ${rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}",
-            "b=AS:$sdpBandwidthAs",
-            "b=RS:0",
-            "b=RR:0",
-            "a=$amrTrackDesc",
-            "a=ptime:20",
-            "a=$remoteMaxptime",
-            "a=$dtmfTrackDesc",
-            "a=$amrFmtpAnswer",
-            "a=fmtp:$dtmfTrack 0-15"
-        )
-        if (callerSupportsPrecondition) {
-            val incomingCurrentQos = if (sendReliable183) "none" else "sendrecv"
-            Rlog.d(
-                TAG,
-                "Incoming precondition SDP answer: callId=$incomingCallId " +
-                    "sendReliable183=$sendReliable183 curr=$incomingCurrentQos",
-            )
-            sdpLines += listOf(
-                "a=curr:qos local $incomingCurrentQos",
-                "a=curr:qos remote $incomingCurrentQos",
-                "a=des:qos mandatory local sendrecv",
-                "a=des:qos mandatory remote sendrecv",
-                "a=conf:qos remote sendrecv"
-            )
-        }
-        sdpLines += "a=sendrecv"
-        /*
-         * Keep generated incoming SDP bodies strictly CRLF-framed, including
-         * the final line terminator. Some IMS SBCs reject/tear down the call
-         * after the 200 OK when the SDP body lacks the trailing CRLF.
-         */
-        val mySdp = (sdpLines.joinToString("\r\n") + "\r\n").toByteArray(Charsets.US_ASCII)
-
-        return IncomingInviteSdpAnswer(
-            reliableSequence = mySeqCounter,
-            body = mySdp,
-        )
-    }
-
-
-    private fun taggedIncomingInviteToHeader(request: SipRequest): List<String> {
-        // Generate a single local tag for all responses in this dialog (RFC 3261 §12.1.1).
-        // Important for tel: URIs: without <> the appended ;tag can be parsed as a TEL URI
-        // parameter instead of a SIP To header parameter, and the network may ignore our 200 OK.
-        val localToTag = randomBytes(6).toHex()
-        val toWithTag = request.headers["to"]!!.map { h -> SipHeaderTagger.addTag(h, localToTag) }
-        Rlog.d(TAG, "Incoming To header normalized/tagged: ${request.headers["to"]!!} -> $toWithTag")
-        return toWithTag
-    }
-
-
-    private fun incomingInviteProvisionalResponseHeaders(
-        request: SipRequest,
-        dialogContact: String,
-        callerSupportsPrecondition: Boolean,
-        reliableSequence: Int,
-        toWithTag: List<String>,
-    ): Map<String, List<String>> {
-        return commonHeaders + //Require: precondition
-            """
-                    Contact: $dialogContact
-                    Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, INFO, MESSAGE, PRACK, OPTIONS
-                    Content-Type: application/sdp
-                    Require: 100rel${if (callerSupportsPrecondition) ", precondition" else ""}
-                    RSeq: $reliableSequence
-                    """.toSipHeadersMap() +
-                        request.headers.filter { (k, _) -> k in listOf("cseq", "via", "from", "to", "call-id", "record-route") } +
-                        mapOf("to" to toWithTag) -
-            "route" - "security-verify"
     }
 
 
     private fun abortIncomingCallSetupIfTerminated(
         incomingCallId: String,
         rtpSocket: DatagramSocket,
-    ): Boolean {
-        if (!wasRecentlyTerminatedIncomingCall(incomingCallId)) return false
-
-        Rlog.w(TAG, "Aborting incoming call setup because Call-ID was terminated before dialog install: callId=$incomingCallId")
-        try { rtpSocket.close() } catch (t: Throwable) { Rlog.d(TAG, "Closing aborted incoming RTP socket failed", t) }
-        return true
-    }
+    ): Boolean =
+        SipIncomingInviteDialogSetup.abortSetupIfTerminated(
+            logTag = TAG,
+            incomingCallId = incomingCallId,
+            rtpSocket = rtpSocket,
+            wasTerminated = wasRecentlyTerminatedIncomingCall(incomingCallId),
+        )
 
 
     private fun installIncomingCallDialogAndNotify(
@@ -6765,21 +5276,30 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         )
         val installedIncomingCall = currentCall
         val installedIncomingCallId = installedIncomingCall?.callIdOrEmpty().orEmpty()
-        if (wasRecentlyTerminatedIncomingCall(incomingCallId) || installedIncomingCallId != incomingCallId || installedIncomingCall !== currentCall) {
-            Rlog.w(TAG, "Aborting incoming ringing because Call-ID was terminated during setup: callId=$incomingCallId installed=$installedIncomingCallId")
-            if (installedIncomingCallId == incomingCallId) {
+        val installAbortDecision = SipIncomingInviteDialogSetup.installAbortDecision(
+            incomingCallId = incomingCallId,
+            wasRecentlyTerminated = wasRecentlyTerminatedIncomingCall(incomingCallId),
+            installedIncomingCallId = installedIncomingCallId,
+            installedStillCurrent = installedIncomingCall === currentCall,
+        )
+        if (installAbortDecision != null) {
+            Rlog.w(TAG, installAbortDecision.message)
+            if (installAbortDecision.clearCurrentCall) {
                 currentCall = null
             }
-            try { rtpSocket.close() } catch (t: Throwable) { Rlog.d(TAG, "Closing aborted incoming RTP socket failed", t) }
+            try { rtpSocket.close() } catch (t: Throwable) { Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.abortedIncomingRtpSocketCloseFailedLog(), t) }
             return false
         }
         onIncomingCall?.invoke(
             Object(),
             callerNumber,
-            mapOf("call-id" to incomingCallId) + SipAudioCodecNegotiator.audioCodecExtras(selectedAudioCodec),
+            SipIncomingInviteDialogSetup.incomingCallNotificationExtras(
+                incomingCallId = incomingCallId,
+                selectedAudioCodec = selectedAudioCodec,
+            ),
         )
 
-        Rlog.d(TAG, "Deferring incoming media threads until final ACK")
+        Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.deferringIncomingMediaUntilFinalAckLog())
         return true
     }
 
@@ -6793,43 +5313,21 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     ) {
         if (sendReliable183) {
             prAckWaitTracker.add(reliableSequence)
-            val msg =
-                SipResponse(
-                    statusCode = 183,
-                    statusString = "Session Progress",
-                    headersParam = headers,
-                    body = sdp
-                )
-            Rlog.d(TAG, "Sending reliable incoming 183 for precondition offer: $msg")
+            val msg = SipIncomingInviteDialogSetup.reliableProvisionalResponse(
+                headers = headers,
+                sdp = sdp,
+            )
+            Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.reliableIncoming183Log(msg))
             writeSipBytesWithFlush(incomingResponseWriter, "SipHandler msg", msg.toByteArray())
             waitPrack(reliableSequence)
         } else {
-            val myHeaders2 = headers - "rseq" - "content-type" - "require" - "p-access-network-info" +
-                """
-Supported: replaces, timer
-Content-Length: 0
-
-""".toSipHeadersMap()
-            val msg2 =
-                SipResponse(
-                    statusCode = 180,
-                    statusString = "Ringing",
-                    headersParam = myHeaders2,
-                    autofill = false
-                )
-            Rlog.d(TAG, "Sending plain 180 Ringing on incoming request flow, no reliable provisional response: $msg2")
+            val msg2 = SipIncomingInviteDialogSetup.plainRingingResponse(headers)
+            Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.plainIncoming180Log(msg2))
             synchronized(incomingResponseWriter) { incomingResponseWriter.write(msg2.toByteArray()) }
         }
     }
 
 
-
-    private data class IncomingInviteDialogSetupState(
-        val rtpSocket: DatagramSocket,
-        val reliableSequence: Int,
-        val sdp: ByteArray,
-        val headers: Map<String, List<String>>,
-    )
 
     private fun prepareIncomingInviteDialogSetupState(
         request: SipRequest,
@@ -6838,15 +5336,6 @@ Content-Length: 0
     ): IncomingInviteDialogSetupState? {
         val rtpRemoteAddr = incomingOffer.rtpRemoteAddr
         val rtpRemotePort = incomingOffer.rtpRemotePort
-        val callerSupportsPrecondition = incomingOffer.callerSupportsPrecondition
-        val sendReliable183 = incomingOffer.sendReliable183
-        val remoteMaxptime = incomingOffer.remoteMaxptime
-        val amrTrackDesc = incomingOffer.amrTrackDesc
-        val amrFmtpAnswer = incomingOffer.amrFmtpAnswer
-        val dtmfTrack = incomingOffer.dtmfTrack
-        val dtmfTrackDesc = incomingOffer.dtmfTrackDesc
-        val allTracks = incomingOffer.allTracks
-        val sdpBandwidthAs = incomingOffer.sdpBandwidthAs
         val owner = incomingOffer.owner
 
         // Need to sleep a bit so that our 100 Trying is sent first. Kinda weird.
@@ -6861,38 +5350,17 @@ Content-Length: 0
             owner = owner,
             incomingCallId = incomingCallId,
         )
-        val incomingSdpAnswer = buildIncomingInviteSdpAnswer(
-            owner = owner,
-            rtpSocket = rtpSocket,
-            sdpBandwidthAs = sdpBandwidthAs,
-            allTracks = allTracks,
-            amrTrackDesc = amrTrackDesc,
-            remoteMaxptime = remoteMaxptime,
-            dtmfTrackDesc = dtmfTrackDesc,
-            amrFmtpAnswer = amrFmtpAnswer,
-            dtmfTrack = dtmfTrack,
-            callerSupportsPrecondition = callerSupportsPrecondition,
-            sendReliable183 = sendReliable183,
-            incomingCallId = incomingCallId,
-        )
-        val mySeqCounter = incomingSdpAnswer.reliableSequence
-        val mySdp = incomingSdpAnswer.body
-
-        val toWithTag = taggedIncomingInviteToHeader(request)
-
-        val myHeaders = incomingInviteProvisionalResponseHeaders(
+        return SipIncomingInviteDialogSetup.buildDialogSetupState(
             request = request,
-            dialogContact = dialogContact,
-            callerSupportsPrecondition = callerSupportsPrecondition,
-            reliableSequence = mySeqCounter,
-            toWithTag = toWithTag,
-        )
-
-        return IncomingInviteDialogSetupState(
+            incomingCallId = incomingCallId,
+            incomingOffer = incomingOffer,
             rtpSocket = rtpSocket,
-            reliableSequence = mySeqCounter,
-            sdp = mySdp,
-            headers = myHeaders,
+            dialogContact = dialogContact,
+            commonHeaders = commonHeaders,
+            reliableSequence = reliableSequenceCounter++,
+            localToTag = randomBytes(6).toHex(),
+            localAddr = socket.gLocalAddr(),
+            logTag = TAG,
         )
     }
 
