@@ -1,4 +1,4 @@
-# PhhIms — VoLTE/VoWiFi for LineageOS on Samsung Exynos devices
+# PhhIms - VoLTE/VoWiFi for LineageOS on Samsung Exynos devices
 
 Open-source SIP/IMS stack for LineageOS, based on [phhusson/ims](https://github.com/phhusson/ims) and the Samsung-focused fork history from [amikhasenko/ims](https://github.com/amikhasenko/ims).
 
@@ -20,29 +20,44 @@ At a high level it:
 
 - requests and tracks the IMS bearer network
 - reads P-CSCF information from `LinkProperties` or falls back to 3GPP DNS discovery
-- performs SIP AKA registration
+- performs SIP AKA registration with Security-Server / IPsec negotiation
 - reports IMS registration state and capabilities back to Android telephony
 - handles VoLTE and VoWiFi voice calls with SIP and RTP
-- handles basic SMS over IMS
+- negotiates AMR-NB / AMR-WB audio, RTP telephone-event DTMF, SIP session timers, IMS preconditions, UPDATE, and re-INVITE media changes
+- handles SMS over IMS with carrier-specific fallback behaviour where required
 - bridges incoming and outgoing SIP call state into Android `ImsCallSession` callbacks
 - avoids tearing down active calls during LTE/IWLAN tech-only handover events
 
 ## Current status
 
-Status is based on the current Samsung LineageOS 23.x test branches. Expect carrier and device differences.
+Status is based on the current Samsung LineageOS 23.x test branches. Expect
+carrier and device differences. This is still a bring-up/testing IMS stack, not
+a generic certified carrier IMS implementation.
 
 | Area | Status |
 | --- | --- |
-| IMS registration | Working in current Exynos9810 and Exynos9830 tests, including retry/reconnect handling after IMS bearer loss or failed REGISTER attempts. |
-| VoLTE outgoing calls | Working in tested configs, including Android call UI, SIP setup, RTP, BYE handling, and two-way audio when ROM-side audio fixes are present. |
-| VoLTE incoming calls | Working in current tests for accept, local end, remote end, and reject paths. Re-test after every dialog/call-state change. |
-| VoWiFi | Working enough for current testing. IWLAN/LTE route changes are still sensitive and depend heavily on QNS / CarrierConfig behavior. |
-| Active VoLTE ↔ VoWiFi switching | Current code defers tech-only IMS reconnects while a call is active/pending or while media threads are still running, so QNS LTE/IWLAN flips no longer kill RTP and leave a fake silent call. Phone-info may still show the original registration tech until the call ends. |
-| SMS over IMS | Basic send/receive path tested. Hardcoded carrier SMSC fallback was removed; the app now relies on framework/identity/SmsManager SMSC sources. |
+| IMS registration | Working in current Exynos9810 and Exynos9830 tests, including AKA/IPsec registration, P-CSCF fallback, REGISTER retry/reconnect handling, 494 fallback handling, and stale IMS bearer recovery. |
+| VoLTE outgoing calls | Working in tested configs, including Android call UI progress, SIP setup, PRACK/session-timer handling, RTP, AMR-NB/AMR-WB negotiation, DTMF, BYE handling, and two-way audio when ROM-side audio fixes are present. |
+| VoLTE incoming calls | Working in current tests for accept, local end, remote end, reject, duplicate INVITE, CANCEL, and precondition call paths. Re-test after every dialog/call-state change. |
+| VoWiFi | Working in current testing. IWLAN/LTE route changes still depend heavily on QNS, CarrierConfig, WFC mode, service state, and Samsung RIL behaviour. |
+| Active VoLTE ↔ VoWiFi switching | Current code defers unsafe tech-only IMS reconnects while a call is active/pending or while media threads are still running. This avoids killing RTP and leaving a fake silent call. Phone-info may still show the original registration tech until the call ends. |
+| SMS over IMS | Basic send/receive path tested. IMS MESSAGE success now waits for RP-layer result where needed. Carrier-specific SMSC and fallback quirks may still need testing. |
+| Audio | SIP/RTP media is handled in userspace, but working microphone/earpiece routing still depends on ROM-side Samsung audio HAL fixes and mixer routing. |
 | USSD/MMI | IMS UT/USSD is not the current goal. Potential USSD/MMI requests are routed over CS when IMS UT/USSD is unavailable. |
 | Video calling / RCS / UT | Not a goal for now. Voice and basic SMS are the focus. |
 
-A common non-IMS fallback mode is: Android has no usable IMS registration when a call starts, so telephony uses circuit-switched fallback and the modem may drop to GSM/EDGE during the call. In that case, inspect IMS network acquisition, P-CSCF discovery, SIP REGISTER, 401 challenge handling, and reconnect retry behavior before assuming the SIP call path failed.
+`SipHandler.kt` has been split into smaller topic-specific helpers for
+registration, SIP message/header building, SDP generation/parsing,
+incoming/outgoing INVITE handling, UPDATE/re-INVITE handling, RTP/audio runtime,
+SMS handling, and dialog termination. `SipHandler` still owns mutable call/dialog
+state, SIP write execution where required, media thread orchestration, callbacks,
+and high-level call-flow decisions.
+
+A common non-IMS fallback mode is: Android has no usable IMS registration when a
+call starts, so telephony uses circuit-switched fallback and the modem may drop
+to GSM/EDGE during the call. In that case, inspect IMS network acquisition,
+P-CSCF discovery, SIP REGISTER, 401 challenge handling, and reconnect retry
+behaviour before assuming the SIP call path failed.
 
 ## Important Samsung-specific background
 
@@ -59,15 +74,37 @@ The code has been iterated around these problem areas:
 
 - delayed SIP handler startup until a valid service state/RPLMN exists
 - correct AKA challenge realm handling for SIP registration
+- Security-Server / IPsec parsing and fallback handling for stricter carriers
 - reconnect/backoff after IMS bearer loss or failed REGISTER attempts
 - avoiding IMS access switches while a call is active, pending, or media is still running
 - outgoing provisional response handling for ringback/progress
+- outgoing PRACK/session-timer handling and conservative SDP retry paths
+- AMR-NB / AMR-WB codec negotiation and RTP media restart after dialog SDP changes
 - separate incoming/outgoing call session state
 - incoming `INVITE` parsing robustness
+- duplicate incoming `INVITE`, late `CANCEL`, PRACK, UPDATE, and final ACK handling
 - incoming accept path: build dialog state before notifying Android, then send `200 OK` and handle ACK correctly
 - incoming reject path: signal busy/reject to the remote side instead of only closing Android UI state
 - call cleanup after BYE/CANCEL/network failure
-- SMS-over-IMS plumbing through the same SIP handler
+- SMS-over-IMS plumbing and RP-layer result handling
+
+## Source layout notes
+
+The SIP stack is intentionally split into topic-specific helper files. Small
+helpers are acceptable when they keep SIP registration, dialog state, RTP/audio,
+SMS, and Android callback behaviour easier to review separately.
+
+Important groups:
+
+- `SipRegister*`, `SipChallenge`, `SipSecurity*`, and `SipIpsec*` handle REGISTER, AKA, Security-Server, and IPsec setup.
+- `SipOutgoingInvite*`, `SipIncomingInvite*`, `SipInDialogInvite`, `SipUpdate*`, and `SipRemoteDialogTermination` handle call signalling.
+- `SipAudio*`, `SipUplink*`, `SipDownlink*`, `SipAmrRtpPayload`, and `SipRtp*` handle userspace media and RTP helpers.
+- `ImsNetwork*`, `ImsReconnectController`, `ImsTransportGuard`, and `WfcSubscriptionSettingMonitor` handle IMS bearer and VoWiFi/VoLTE access changes.
+- `SipSmsHandler`, `Sms`, and `SmscAddress` handle SMS-over-IMS.
+
+Keep behavioural fixes, carrier policy changes, audio/media changes, and pure
+refactors in separate commits when possible. That makes regressions much easier
+to bisect.
 
 ## Repository integration
 
@@ -240,8 +277,9 @@ Known ROM-side pieces used in current testing:
 Validation checklist used for Exynos9810:
 
 - IMS registers on LTE.
-- Outgoing VoLTE call connects, has ringback/progress, two-way audio, and clean BYE handling.
-- Incoming VoLTE accept, local end, remote end, and reject work.
+- Outgoing VoLTE call connects, has ringback/progress, two-way audio, DTMF, and clean BYE handling.
+- Incoming VoLTE accept, local end, remote end, reject, duplicate INVITE, and late CANCEL paths work.
+- AMR-NB fallback and AMR-WB negotiation are checked where the carrier/device exposes HD voice.
 - SMS send and receive work after IMS reconnects.
 - USSD/MMI routes over CS when IMS UT/USSD is unavailable.
 - VoWiFi registers and calls work when WFC is enabled.
@@ -266,6 +304,7 @@ Validation checklist used for Exynos9830:
 - IMS registers on LTE.
 - IMS can register on IWLAN / VoWiFi when WFC is enabled.
 - Outgoing and incoming calls work on VoLTE and VoWiFi.
+- AMR-NB fallback, AMR-WB negotiation, DTMF, and dialog SDP media changes are checked where possible.
 - LTE ↔ IWLAN route changes during active calls keep audio alive.
 - Phone-info may keep showing the original IMS registration tech during a deferred active-call switch; the important runtime check is that RTP and DTMF continue.
 - If IMS is unavailable when a call starts, Android may use CS fallback and show GSM/GPRS/2G radio tech for that call.
@@ -462,7 +501,7 @@ For ROM integration, use the in-tree Soong build instead.
 - The app must be privileged and platform-signed.
 - Carrier provisioning still matters. A carrier that does not provision IMS for the SIM/device combination may never register.
 - Keep registration, VoLTE, VoWiFi, SMS, and audio changes in separate commits while rebasing; it makes regressions much easier to isolate.
-- For Samsung bring-up, always test: registration, outgoing call, incoming accept, incoming reject, SMS, VoWiFi-only, VoLTE-only, VoLTE→VoWiFi, VoWiFi→VoLTE, and active-call route switching.
+- For Samsung bring-up, always test: registration, outgoing call, incoming accept, incoming local end, incoming remote end, incoming reject, SMS send/receive, DTMF, VoWiFi-only, VoLTE-only, VoLTE→VoWiFi, VoWiFi→VoLTE, active-call route switching, and reconnect after IMS bearer loss.
 
 ## License
 
