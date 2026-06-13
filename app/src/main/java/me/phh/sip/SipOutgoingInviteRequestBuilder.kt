@@ -25,6 +25,28 @@ private data class OutgoingInviteCarrierRequestShape(
 )
 
 internal object SipOutgoingInviteRequestBuilder {
+
+    // Vodafone TR carrier policy helpers.
+    private fun isVodafoneTurkeyCarrier(mcc: String, mnc: String): Boolean {
+        val normalizedMnc = mnc.trimStart('0').ifBlank { "0" }
+        return mcc == "286" && normalizedMnc == "2"
+    }
+
+    // Vodafone TR 542 local IMS service URI.
+    private fun vodafoneTurkeyLocalServiceTelUri(
+        normalizedPhoneNumber: String,
+        mcc: String,
+        mnc: String,
+    ): String? {
+        if (!isVodafoneTurkeyCarrier(mcc, mnc)) {
+            return null
+        }
+
+        return when (normalizedPhoneNumber) {
+            "542" -> "tel:542"
+            else -> null
+        }
+    }
     fun build(
         logTag: String,
         phoneNumber: String,
@@ -97,11 +119,18 @@ internal object SipOutgoingInviteRequestBuilder {
         minSeSeconds: Int,
         generatedCallIdHeaders: Map<String, List<String>>,
     ): OutgoingInviteBaseRequestContext {
-        val to = if (normalizedPhoneNumber.startsWith("+")) {
+        val to = vodafoneTurkeyLocalServiceTelUri(
+            normalizedPhoneNumber = normalizedPhoneNumber,
+            mcc = mcc,
+            mnc = mnc,
+        ) ?: if (normalizedPhoneNumber.startsWith("+")) {
             // Global TEL URIs must stand on their own. Adding phone-context to +E.164
             // numbers makes some IMS cores drop the INVITE without any SIP response.
             "tel:$normalizedPhoneNumber"
         } else {
+            // Vodafone TR 542 local IMS service URI: Vodafone TR 542 is a local
+            // IMS service call and must stay plain tel:542. Other local numbers
+            // keep the generic IMS phone-context.
             "tel:$normalizedPhoneNumber;phone-context=ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
         }
         Rlog.d(logTag, "Outgoing dial target raw=$phoneNumber normalized=$normalizedPhoneNumber uri=$to")
