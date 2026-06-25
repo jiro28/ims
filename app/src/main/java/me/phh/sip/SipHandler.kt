@@ -150,6 +150,46 @@ class SipHandler(
      * Keep logging the byte count and first line so carrier-specific transaction
      * failures can be correlated with the exact request/response sent.
      */
+
+    private fun phhA1hrCarrierTestOnly(): Boolean =
+        homeOperatorForIms == "21910" ||
+            homeOperatorForIms == "219010" ||
+            (mcc == "219" && (mnc == "10" || mnc == "010"))
+
+    private fun phhA1hrPaniVisitedRegisterBytesTestOnly(bytes: ByteArray): ByteArray {
+        if (!phhA1hrCarrierTestOnly()) return bytes
+
+        val raw = bytes.toString(Charsets.US_ASCII)
+        if (!raw.startsWith("REGISTER ")) return bytes
+        if (raw.contains("P-Access-Network-Info:", ignoreCase = true)) return bytes
+
+        val injectedHeaders =
+            "P-Access-Network-Info: 3GPP-E-UTRAN-FDD\r\n" +
+                "P-Visited-Network-ID: \"ims.mnc010.mcc219.3gppnetwork.org\"\r\n"
+
+        val rewritten = when {
+            raw.contains("\r\n\r\n") -> {
+                val idx = raw.indexOf("\r\n\r\n")
+                raw.substring(0, idx + 2) + injectedHeaders + raw.substring(idx + 2)
+            }
+            raw.contains("\n\n") -> {
+                val idx = raw.indexOf("\n\n")
+                val lfInjectedHeaders = injectedHeaders.replace("\r\n", "\n")
+                raw.substring(0, idx + 1) + lfInjectedHeaders + raw.substring(idx + 1)
+            }
+            else -> {
+                Rlog.w(TAG, "A1HR_PANI_VISITED_SKIP_SUBSCRIBE_TEST_ONLY_V2: REGISTER had no header/body separator; not adding PANI")
+                return bytes
+            }
+        }
+
+        Rlog.d(
+            TAG,
+            "A1HR_PANI_VISITED_SKIP_SUBSCRIBE_TEST_ONLY_V2: added REGISTER P-Access-Network-Info and P-Visited-Network-ID for A1 HR / 21910",
+        )
+        return rewritten.toByteArray(Charsets.US_ASCII)
+    }
+
     private fun writeSipBytesWithFlush(
         writer: java.io.OutputStream,
         label: String,
@@ -2256,9 +2296,10 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             useSelectedSecurityClient = registerTargetRealm != realm,
             forceSecurityAgreementNullEalg = false,
         )
-        Rlog.d(TAG, "Sending $msg")
+        val a1hrRegisterBytes = phhA1hrPaniVisitedRegisterBytesTestOnly(msg.toByteArray())
+        Rlog.d(TAG, "Sending ${a1hrRegisterBytes.toString(Charsets.US_ASCII)}")
         synchronized(writer) {
-            writer.write(msg.toByteArray())
+            writer.write(a1hrRegisterBytes)
             writer.flush()
         }
         registerCounter += 1
@@ -2274,7 +2315,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         myTel = registeredIdentity.myTel
         commonHeaders += registeredIdentity.commonHeaders()
 
-        subscribe()
+        if (phhA1hrCarrierTestOnly()) {
+            Rlog.d(TAG, "A1HR_PANI_VISITED_SKIP_SUBSCRIBE_TEST_ONLY_V2: skipping reg-event SUBSCRIBE for A1 HR / 21910 after REGISTER success")
+        } else {
+            subscribe()
+        }
 
         // REGISTER 200 OK is the actual IMS registration success.  Do not
         // block framework registration state on the optional reg-event
