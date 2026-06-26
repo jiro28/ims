@@ -33,9 +33,6 @@ internal object SipOutgoingInviteRequestBuilder {
     // context". Keep E.164 targets unchanged, and keep the known Vodafone TR
     // service-number exception plain because that carrier rejected the generic
     // MCC/MNC context for 542.
-    private fun normalizedMncForPhoneContext(mnc: String): String =
-        mnc.trim().trimStart('0').ifBlank { "0" }.padStart(3, '0')
-
     private fun phoneContextForLocalTelUri(realm: String, mcc: String, mnc: String): String {
         val candidate = realm.trim()
             .removePrefix("sip:")
@@ -49,33 +46,15 @@ internal object SipOutgoingInviteRequestBuilder {
             return candidate
         }
 
-        return "ims.mnc${normalizedMncForPhoneContext(mnc)}.mcc${mcc.trim().padStart(3, '0')}.3gppnetwork.org"
-    }
-
-    // Kept separate because Vodafone TR outgoing PANI policy uses this too.
-    private fun isVodafoneTurkeyCarrier(mcc: String, mnc: String): Boolean =
-        mcc.trim() == "286" && normalizedMncForPhoneContext(mnc) == "002"
-
-    private fun shouldKeepShortServicePlainTel(
-        normalizedPhoneNumber: String,
-        mcc: String,
-        mnc: String,
-    ): Boolean {
-        // Confirmed compatibility exception: Vodafone TR service code 542 worked
-        // as plain tel:<digits> and broke with the generic MCC/MNC phone-context.
-        return isVodafoneTurkeyCarrier(mcc, mnc) &&
-            normalizedPhoneNumber.length in 3..6 &&
-            normalizedPhoneNumber.all { it.isDigit() }
+        return "ims.mnc${SipCarrierSettings.normalizedMncForPhoneContext(mnc)}.mcc${mcc.trim().padStart(3, '0')}.3gppnetwork.org"
     }
 
     private fun shortServiceTelUri(
         normalizedPhoneNumber: String,
-        mcc: String,
-        mnc: String,
+        carrierSettings: SipCarrierSettings,
         realm: String,
     ): String? {
-        if (normalizedPhoneNumber.length !in 3..6 ||
-            !normalizedPhoneNumber.all { it.isDigit() }) {
+        if (!SipCarrierSettings.isLocalShortCode(normalizedPhoneNumber)) {
             return null
         }
 
@@ -95,34 +74,11 @@ internal object SipOutgoingInviteRequestBuilder {
             return "tel:$normalizedPhoneNumber"
         }
 
-        if (shouldKeepShortServicePlainTel(normalizedPhoneNumber, mcc, mnc)) {
+        if (carrierSettings.shouldKeepShortServicePlainTel(normalizedPhoneNumber)) {
             return "tel:$normalizedPhoneNumber"
         }
 
-        return "tel:$normalizedPhoneNumber;phone-context=${phoneContextForLocalTelUri(realm, mcc, mnc)}"
-    }
-
-    // Vodafone TR carrier policy helpers.
-
-    // Vodafone TR outgoing PANI policy.
-    private fun vodafoneTurkeyOutgoingPaniHeaders(
-        mcc: String,
-        mnc: String,
-        registrationTech: Int,
-    ): Map<String, List<String>> {
-        if (!isVodafoneTurkeyCarrier(mcc, mnc)) {
-            return emptyMap()
-        }
-
-        val paniValue = when (registrationTech) {
-            android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_IWLAN -> "IEEE-802.11"
-            android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_LTE -> "3GPP-E-UTRAN-FDD"
-            else -> null
-        }
-
-        return paniValue
-            ?.let { mapOf("P-Access-Network-Info" to listOf(it)) }
-            ?: emptyMap()
+        return "tel:$normalizedPhoneNumber;phone-context=${phoneContextForLocalTelUri(realm, carrierSettings.mcc, carrierSettings.mnc)}"
     }
 
 
@@ -131,8 +87,7 @@ internal object SipOutgoingInviteRequestBuilder {
         phoneNumber: String,
         outgoingInviteBody: ByteArray,
         normalizedPhoneNumber: String,
-        mcc: String,
-        mnc: String,
+        carrierSettings: SipCarrierSettings,
         realm: String,
         registrationTech: Int,
         mySip: String,
@@ -152,8 +107,7 @@ internal object SipOutgoingInviteRequestBuilder {
             logTag = logTag,
             phoneNumber = phoneNumber,
             normalizedPhoneNumber = normalizedPhoneNumber,
-            mcc = mcc,
-            mnc = mnc,
+            carrierSettings = carrierSettings,
             realm = realm,
             registrationTech = registrationTech,
             mySip = mySip,
@@ -190,8 +144,7 @@ internal object SipOutgoingInviteRequestBuilder {
         logTag: String,
         phoneNumber: String,
         normalizedPhoneNumber: String,
-        mcc: String,
-        mnc: String,
+        carrierSettings: SipCarrierSettings,
         realm: String,
         registrationTech: Int,
         mySip: String,
@@ -206,8 +159,7 @@ internal object SipOutgoingInviteRequestBuilder {
     ): OutgoingInviteBaseRequestContext {
         val to = shortServiceTelUri(
             normalizedPhoneNumber = normalizedPhoneNumber,
-            mcc = mcc,
-            mnc = mnc,
+            carrierSettings = carrierSettings,
             realm = realm,
         ) ?: if (normalizedPhoneNumber.startsWith("+")) {
             // Global TEL URIs must stand on their own. Adding phone-context to +E.164
@@ -216,14 +168,13 @@ internal object SipOutgoingInviteRequestBuilder {
         } else {
             // Short service numbers were handled above. Other local numbers
             // keep the generic IMS phone-context.
-            "tel:$normalizedPhoneNumber;phone-context=${phoneContextForLocalTelUri(realm, mcc, mnc)}"
+            "tel:$normalizedPhoneNumber;phone-context=${phoneContextForLocalTelUri(realm, carrierSettings.mcc, carrierSettings.mnc)}"
         }
         Rlog.d(logTag, "Outgoing dial target raw=$phoneNumber normalized=$normalizedPhoneNumber uri=$to")
         val sipInstance = "<urn:gsma:imei:${imei.substring(0, 8)}-${imei.substring(8, 14)}-0>"
         val contactTel =
             """<sip:$myTel@$localEndpoint;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
-        val vodafoneTurkeyPaniHeaders =
-            vodafoneTurkeyOutgoingPaniHeaders(mcc, mnc, registrationTech)
+        val carrierPaniHeaders = carrierSettings.outgoingPaniHeaders(registrationTech)
 
         val myHeaders = commonHeaders +
             """
@@ -244,7 +195,7 @@ internal object SipOutgoingInviteRequestBuilder {
                 Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
                 P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
                 Contact: $contactTel
-                """.toSipHeadersMap() + vodafoneTurkeyPaniHeaders +
+                """.toSipHeadersMap() + carrierPaniHeaders +
             generatedCallIdHeaders - "p-asserted-identity"
         // P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
         // Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"

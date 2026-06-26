@@ -150,23 +150,18 @@ class SipHandler(
      * Keep logging the byte count and first line so carrier-specific transaction
      * failures can be correlated with the exact request/response sent.
      */
-    private fun isA1HrCarrier(): Boolean =
-        homeOperatorForIms == "21910" ||
-            homeOperatorForIms == "219010" ||
-            (mcc == "219" && (mnc == "10" || mnc == "010"))
-
-    private fun addA1HrRegisterNetworkHeaders(bytes: ByteArray): ByteArray {
-        if (!isA1HrCarrier()) return bytes
+    private fun addCarrierRegisterNetworkHeaders(bytes: ByteArray): ByteArray {
+        val configuredHeaders = carrierSettings.registerNetworkHeaders
+        if (configuredHeaders.isEmpty()) return bytes
 
         val raw = bytes.toString(Charsets.US_ASCII)
         if (!raw.startsWith("REGISTER ")) return bytes
 
         val missingHeaders = buildString {
-            if (!raw.contains("P-Access-Network-Info:", ignoreCase = true)) {
-                append("P-Access-Network-Info: 3GPP-E-UTRAN-FDD\r\n")
-            }
-            if (!raw.contains("P-Visited-Network-ID:", ignoreCase = true)) {
-                append("P-Visited-Network-ID: \"ims.mnc010.mcc219.3gppnetwork.org\"\r\n")
+            configuredHeaders.forEach { (name, values) ->
+                if (!raw.contains("$name:", ignoreCase = true)) {
+                    values.forEach { value -> append("$name: $value\r\n") }
+                }
             }
         }
         if (missingHeaders.isEmpty()) return bytes
@@ -181,12 +176,12 @@ class SipHandler(
                 raw.substring(0, idx + 1) + missingHeaders.replace("\r\n", "\n") + raw.substring(idx + 1)
             }
             else -> {
-                Rlog.w(TAG, "REGISTER had no header/body separator; not adding A1 HR access-network headers")
+                Rlog.w(TAG, "REGISTER had no header/body separator; not adding carrier access-network headers")
                 return bytes
             }
         }
 
-        Rlog.d(TAG, "Added A1 HR REGISTER access-network headers")
+        Rlog.d(TAG, "Added carrier REGISTER network headers for ${carrierSettings.mccMnc}")
         return rewritten.toByteArray(Charsets.US_ASCII)
     }
 
@@ -420,6 +415,7 @@ private val smsHandler = SipSmsHandler(
         tag = TAG,
         ctxt = ctxt,
         subId = subId,
+        carrierSettings = carrierSettings,
         realmProvider = { realm },
         commonHeadersProvider = { commonHeaders },
         mySipProvider = { mySip },
@@ -643,13 +639,11 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
             return true
         }
 
-        val normalizedMnc = mnc.trimStart('0').ifBlank { "0" }
-        val isDreiAt = mcc == "232" && normalizedMnc == "5"
-        if (isDreiAt && normalizedNumber == "333") {
+        if (carrierSettings.shouldForceCsfbForDialCode(normalizedNumber)) {
             Rlog.w(
                 TAG,
-                "Forcing CSFB for 3 AT service code that reached IMS stripped: " +
-                    "raw=$number normalized=$normalizedNumber",
+                "Forcing CSFB for carrier-configured service code that reached IMS stripped: " +
+                    "raw=$number normalized=$normalizedNumber carrier=${carrierSettings.mccMnc}",
             )
             return true
         }
@@ -2263,11 +2257,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         commonHeaders += update.headers
     }
 
-
-    private fun useSingTelNullSha1SecurityOffer(): Boolean =
-        realm.equals("ims.mnc001.mcc525.3gppnetwork.org", ignoreCase = true) ||
-            registerTargetRealm.equals("ims.singtel.com", ignoreCase = true)
-
     fun register(_writer: OutputStream? = null) {
         RegistrationCellInfoLogger.log(TAG, subTelephonyManager)
 
@@ -2290,13 +2279,13 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             clientPort = socket.gLocalPort(),
             serverPort = serverSocket.localPort,
             securityClientOverride = registerSecurityClientOverride,
-            securityClientAlgs = if (useSingTelNullSha1SecurityOffer()) listOf("hmac-sha-1-96") else listOf("hmac-sha-1-96", "hmac-md5-96"),
-            securityClientEalgs = if (useSingTelNullSha1SecurityOffer()) listOf("null") else listOf("null", "aes-cbc"),
+            securityClientAlgs = carrierSettings.registerSecurityClientAlgs(realm, registerTargetRealm),
+            securityClientEalgs = carrierSettings.registerSecurityClientEalgs(realm, registerTargetRealm),
             stripSecurityVerifyQ = false,
             useSelectedSecurityClient = registerTargetRealm != realm,
             forceSecurityAgreementNullEalg = false,
         )
-        val registerBytesWithNetworkHeaders = addA1HrRegisterNetworkHeaders(msg.toByteArray())
+        val registerBytesWithNetworkHeaders = addCarrierRegisterNetworkHeaders(msg.toByteArray())
         Rlog.d(TAG, "Sending ${registerBytesWithNetworkHeaders.toString(Charsets.US_ASCII)}")
         synchronized(writer) {
             writer.write(registerBytesWithNetworkHeaders)
@@ -2315,8 +2304,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         myTel = registeredIdentity.myTel
         commonHeaders += registeredIdentity.commonHeaders()
 
-        if (isA1HrCarrier()) {
-            Rlog.d(TAG, "Skipping reg-event SUBSCRIBE for A1 HR; REGISTER success is sufficient")
+        if (carrierSettings.skipRegEventSubscribe) {
+            Rlog.d(TAG, "Skipping reg-event SUBSCRIBE for carrier ${carrierSettings.mccMnc}; REGISTER success is sufficient")
         } else {
             subscribe()
         }
@@ -3756,29 +3745,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
      * protected originating MMTEL INVITEs before 100 Trying on the LTE IMS path.
      * Keep the special request shape scoped to SingTel.
      */
-    private fun isSingTelStockOutgoingCarrier(): Boolean =
-        (mcc == "525" && (mnc == "001" || mnc == "01")) ||
-            realm.equals("ims.mnc001.mcc525.3gppnetwork.org", ignoreCase = true) ||
-            registerTargetRealm.equals("ims.singtel.com", ignoreCase = true)
-
-    private fun singtelStockLocalNumberForPhoneContext(number: String): String {
-        val digits = number.trim().trimStart('+')
-        return if (digits.startsWith("65") && digits.length == 10) {
-            digits.substring(2)
-        } else {
-            digits
-        }
-    }
-
-    private fun singtelPublicSipUri(number: String): String {
-        val digits = singtelStockLocalNumberForPhoneContext(number)
-        val e164 = if (digits.startsWith("+") || digits.startsWith("65")) {
-            if (digits.startsWith("+")) digits else "+$digits"
-        } else {
-            "+65$digits"
-        }
-        return "sip:$e164@ims.singtel.com"
-    }
+    private fun useSingTelStockOutgoingPolicy(): Boolean =
+        carrierSettings.useSingTelStockPolicy(realm, registerTargetRealm)
 
     private fun createOutgoingCallRtpSocket(): DatagramSocket? {
         val rtpSocket = try {
@@ -3822,7 +3790,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             localHost = "${socket.gLocalAddr().hostAddress}",
             ipType = if (localAddr is Inet6Address) "IP6" else "IP4",
             amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
-            singtelStockOutgoingCarrier = isSingTelStockOutgoingCarrier(),
+            singtelStockOutgoingCarrier = useSingTelStockOutgoingPolicy(),
         )
     }
 
@@ -3845,8 +3813,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             phoneNumber = phoneNumber,
             outgoingInviteBody = outgoingInviteBody,
             normalizedPhoneNumber = normalizedPhoneNumber,
-            mcc = mcc,
-            mnc = mnc,
+            carrierSettings = carrierSettings,
             realm = realm,
             registrationTech = imsRegistrationTech,
             mySip = mySip,
@@ -3859,8 +3826,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             sessionExpiresSeconds = outgoingInviteSessionTimer.sessionExpiresSeconds,
             minSeSeconds = outgoingInviteSessionTimer.minSeSeconds,
             generatedCallIdHeaders = generateCallId(),
-            singtelStockOutgoingCarrier = isSingTelStockOutgoingCarrier(),
-            singtelPublicSipUri = { number -> singtelPublicSipUri(number) },
+            singtelStockOutgoingCarrier = useSingTelStockOutgoingPolicy(),
+            singtelPublicSipUri = { number -> carrierSettings.singtelPublicSipUri(number) },
         )
     }
 
