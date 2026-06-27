@@ -31,6 +31,16 @@ data class SipInviteFailurePolicy(
         "SDP is illegal",
         "illegal SDP",
     ),
+    val reconnectOnAuthFailure: Boolean = true,
+    val authFailureStatusCodes: Set<Int> = setOf(500),
+    val authFailureMarkerSubstrings: List<String> = listOf(
+        "AUTH failure",
+        "not authorised",
+        "not authorized",
+    ),
+    val authFailureReconnectDelayMs: Long = 1_000L,
+    val reconnectAfterFinalFailureStatusCodes: Set<Int> = emptySet(),
+    val reconnectAfterFinalFailureDelayMs: Long = 1_000L,
 )
 
 data class SipCarrierPolicy(

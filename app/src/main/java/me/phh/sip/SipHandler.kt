@@ -531,7 +531,11 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
     }
 
     private fun isOutgoingInviteAuthFailure(response: SipResponse): Boolean {
-        if (response.statusCode != 500) {
+        val inviteFailurePolicy = carrierSettings.inviteFailurePolicy
+        if (!inviteFailurePolicy.reconnectOnAuthFailure) {
+            return false
+        }
+        if (response.statusCode !in inviteFailurePolicy.authFailureStatusCodes) {
             return false
         }
 
@@ -550,9 +554,9 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         val warning = sipHeaderValues(response, "warning").joinToString(" ")
         val combined = "$debugInfo $warning $responseText"
 
-        return combined.contains("AUTH failure", ignoreCase = true) ||
-            combined.contains("not authorised", ignoreCase = true) ||
-            combined.contains("not authorized", ignoreCase = true)
+        return inviteFailurePolicy.authFailureMarkerSubstrings.any { marker ->
+            combined.contains(marker, ignoreCase = true)
+        }
     }
 
     fun handleResponse(response: SipResponse): Boolean {
@@ -564,7 +568,10 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
                 "Outgoing INVITE failed with SIP auth/security context error; " +
                     "scheduling IMS reconnect",
             )
-            scheduleReconnectRetry("outgoing INVITE auth failure", 1000L)
+            scheduleReconnectRetry(
+                "outgoing INVITE auth failure",
+                carrierSettings.inviteFailurePolicy.authFailureReconnectDelayMs,
+            )
         }
 
         return keepCallback
@@ -4203,6 +4210,32 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     }
 
 
+    private fun maybeScheduleCarrierConfiguredOutgoingInviteFinalFailureRecovery(
+        response: SipResponse,
+        failedCseq: String,
+        failedCallId: String,
+    ) {
+        if (!failedCseq.contains("INVITE", ignoreCase = true)) {
+            return
+        }
+
+        val inviteFailurePolicy = carrierSettings.inviteFailurePolicy
+        if (response.statusCode !in inviteFailurePolicy.reconnectAfterFinalFailureStatusCodes) {
+            return
+        }
+
+        Rlog.w(
+            TAG,
+            "Scheduling IMS reconnect after carrier-configured outgoing INVITE failure: " +
+                "status=${response.statusCode} callId=$failedCallId cseq=$failedCseq " +
+                "delayMs=${inviteFailurePolicy.reconnectAfterFinalFailureDelayMs}",
+        )
+        scheduleReconnectRetry(
+            "outgoing INVITE final failure ${response.statusCode}",
+            inviteFailurePolicy.reconnectAfterFinalFailureDelayMs,
+        )
+    }
+
     private fun handleOutgoingProgressOrFailureResponse(
         response: SipResponse,
         cseq: String,
@@ -4253,6 +4286,12 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             ) {
                 return false
             }
+
+            maybeScheduleCarrierConfiguredOutgoingInviteFinalFailureRecovery(
+                response = response,
+                failedCseq = failedCseq,
+                failedCallId = failedCallId,
+            )
 
             Rlog.w(
                 TAG,
