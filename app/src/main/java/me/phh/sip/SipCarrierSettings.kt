@@ -166,6 +166,15 @@ data class SipCarrierPolicy(
         return "sip:$e164@$SINGTEL_STOCK_REALM"
     }
 
+    fun usePublicSipUriOutgoingPolicy(): Boolean =
+        outgoingInviteShape == OutgoingInviteShape.PUBLIC_SIP_URI_USER_PHONE
+
+    fun publicSipUriForPhoneNumber(number: String, realm: String): String {
+        val digits = number.trim()
+        val user = if (digits.startsWith("+")) digits else "+$digits"
+        return "sip:$user@${phoneContextForLocalTelUri(realm)};user=phone"
+    }
+
     fun singtelSmsc(): String = SINGTEL_STOCK_SMSC
 
     fun smsRequestUri(realm: String, smsc: String?, smscSipIdentity: String?): String =
@@ -196,6 +205,7 @@ data class SipCarrierPolicy(
     enum class OutgoingInviteShape {
         DEFAULT,
         SINGTEL_COMPACT_STOCK,
+        PUBLIC_SIP_URI_USER_PHONE,
     }
 
     companion object {
@@ -251,11 +261,15 @@ data class SipCarrierPolicy(
                 "401077" -> defaultFor(mcc, mnc).copy(
                     // KZ IMS exposes +7 mobile/public numbers without the
                     // country code on HD calls and rejects outgoing TEL URIs
-                    // built from that local form.
+                    // built from that local form. It also rejects originating
+                    // MMTEL INVITEs that keep the public target as a TEL URI,
+                    // so send public E.164 call targets as SIP user=phone URIs.
                     publicNumberNormalizationPolicy =
                         SipPublicNumberNormalizationPolicy(
                             kazakhstanMobileWithoutCountryCode = true,
                         ),
+                    outgoingPaniPolicy = OutgoingPaniPolicy.REGISTRATION_ACCESS_TECH,
+                    outgoingInviteShape = OutgoingInviteShape.PUBLIC_SIP_URI_USER_PHONE,
                 )
 
                 "450006" -> defaultFor(mcc, mnc).copy(
@@ -342,6 +356,12 @@ data class SipCarrierSettings(
 
     fun singtelPublicSipUri(number: String): String =
         policy.singtelPublicSipUri(number)
+
+    fun usePublicSipUriOutgoingPolicy(): Boolean =
+        policy.usePublicSipUriOutgoingPolicy()
+
+    fun publicSipUriForPhoneNumber(number: String, realm: String): String =
+        policy.publicSipUriForPhoneNumber(number, realm)
 
     fun singtelSmsc(): String =
         policy.singtelSmsc()

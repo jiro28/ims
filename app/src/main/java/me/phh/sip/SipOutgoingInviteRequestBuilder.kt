@@ -95,6 +95,7 @@ internal object SipOutgoingInviteRequestBuilder {
             generatedCallIdHeaders = generatedCallIdHeaders,
         )
         val carrierRequestShape = buildCarrierRequestShape(
+            logTag = logTag,
             normalizedPhoneNumber = baseRequestContext.normalizedPhoneNumber,
             telUri = baseRequestContext.telUri,
             baseHeaders = baseRequestContext.baseHeaders,
@@ -104,6 +105,8 @@ internal object SipOutgoingInviteRequestBuilder {
             myTel = myTel,
             imsi = imsi,
             commonHeaders = commonHeaders,
+            carrierSettings = carrierSettings,
+            realm = realm,
             singtelStockOutgoingCarrier = singtelStockOutgoingCarrier,
             singtelPublicSipUri = singtelPublicSipUri,
         )
@@ -185,6 +188,7 @@ internal object SipOutgoingInviteRequestBuilder {
     }
 
     private fun buildCarrierRequestShape(
+        logTag: String,
         normalizedPhoneNumber: String,
         telUri: String,
         baseHeaders: Map<String, List<String>>,
@@ -194,6 +198,8 @@ internal object SipOutgoingInviteRequestBuilder {
         myTel: String,
         imsi: String,
         commonHeaders: Map<String, List<String>>,
+        carrierSettings: SipCarrierSettings,
+        realm: String,
         singtelStockOutgoingCarrier: Boolean,
         singtelPublicSipUri: (String) -> String,
     ): OutgoingInviteCarrierRequestShape {
@@ -258,9 +264,35 @@ internal object SipOutgoingInviteRequestBuilder {
             baseHeaders
         }
 
+        if (singtelStockOutgoingCarrier) {
+            return OutgoingInviteCarrierRequestShape(
+                targetUri = singtelStockOutgoingTargetUri,
+                headers = singtelStockOutgoingHeaders,
+            )
+        }
+
+        if (carrierSettings.usePublicSipUriOutgoingPolicy() &&
+            normalizedPhoneNumber.startsWith("+")) {
+            val publicTargetUri = carrierSettings.publicSipUriForPhoneNumber(
+                number = normalizedPhoneNumber,
+                realm = realm,
+            )
+            Rlog.w(
+                logTag,
+                "Carrier-policy using public SIP URI for outgoing INVITE: " +
+                    "number=$normalizedPhoneNumber target=$publicTargetUri " +
+                    "carrier=${carrierSettings.mccMnc}",
+            )
+
+            return OutgoingInviteCarrierRequestShape(
+                targetUri = publicTargetUri,
+                headers = baseHeaders - "to" + mapOf("to" to listOf("<$publicTargetUri>")),
+            )
+        }
+
         return OutgoingInviteCarrierRequestShape(
-            targetUri = singtelStockOutgoingTargetUri,
-            headers = singtelStockOutgoingHeaders,
+            targetUri = telUri,
+            headers = baseHeaders,
         )
     }
 
