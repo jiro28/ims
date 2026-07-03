@@ -171,10 +171,19 @@ data class SipCarrierPolicy(
     fun usePublicSipUriOutgoingPolicy(): Boolean =
         outgoingInviteShape == OutgoingInviteShape.PUBLIC_SIP_URI_USER_PHONE
 
+    fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
+        outgoingInviteShape == OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT
+
     fun publicSipUriForPhoneNumber(number: String, realm: String): String {
         val user = publicSipUriUserForPhoneNumber(number)
         val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
         return "sip:$user@$domain;user=phone"
+    }
+
+    fun localTelPhoneContextUriForPhoneNumber(number: String, realm: String): String {
+        val user = publicSipUriUserForPhoneNumber(number)
+        val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
+        return "tel:$user;phone-context=$domain"
     }
 
     private fun publicSipUriUserForPhoneNumber(number: String): String {
@@ -229,6 +238,7 @@ data class SipCarrierPolicy(
         DEFAULT,
         SINGTEL_COMPACT_STOCK,
         PUBLIC_SIP_URI_USER_PHONE,
+        LOCAL_TEL_PHONE_CONTEXT,
     }
 
     companion object {
@@ -292,7 +302,7 @@ data class SipCarrierPolicy(
                             kazakhstanMobileWithoutCountryCode = true,
                         ),
                     outgoingPaniPolicy = OutgoingPaniPolicy.REGISTRATION_ACCESS_TECH,
-                    outgoingInviteShape = OutgoingInviteShape.PUBLIC_SIP_URI_USER_PHONE,
+                    outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
                     // Tele2 KZ rejects targets under the generic 3GPP realm
@@ -393,8 +403,14 @@ data class SipCarrierSettings(
     fun usePublicSipUriOutgoingPolicy(): Boolean =
         policy.usePublicSipUriOutgoingPolicy()
 
+    fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
+        policy.useLocalTelPhoneContextOutgoingPolicy()
+
     fun publicSipUriForPhoneNumber(number: String, realm: String): String =
         policy.publicSipUriForPhoneNumber(number, realm)
+
+    fun localTelPhoneContextUriForPhoneNumber(number: String, realm: String): String =
+        policy.localTelPhoneContextUriForPhoneNumber(number, realm)
 
     fun singtelSmsc(): String =
         policy.singtelSmsc()

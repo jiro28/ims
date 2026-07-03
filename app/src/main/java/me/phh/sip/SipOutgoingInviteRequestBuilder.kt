@@ -271,6 +271,25 @@ internal object SipOutgoingInviteRequestBuilder {
             )
         }
 
+        if (carrierSettings.useLocalTelPhoneContextOutgoingPolicy() &&
+            normalizedPhoneNumber.startsWith("+")) {
+            val localTargetUri = carrierSettings.localTelPhoneContextUriForPhoneNumber(
+                number = normalizedPhoneNumber,
+                realm = realm,
+            )
+            Rlog.w(
+                logTag,
+                "Carrier-policy using local TEL phone-context for outgoing INVITE: " +
+                    "number=$normalizedPhoneNumber target=$localTargetUri " +
+                    "carrier=${carrierSettings.mccMnc}",
+            )
+
+            return OutgoingInviteCarrierRequestShape(
+                targetUri = localTargetUri,
+                headers = baseHeaders - "to" + mapOf("to" to listOf("<$localTargetUri>")),
+            )
+        }
+
         if (carrierSettings.usePublicSipUriOutgoingPolicy() &&
             normalizedPhoneNumber.startsWith("+")) {
             val publicTargetUri = carrierSettings.publicSipUriForPhoneNumber(
