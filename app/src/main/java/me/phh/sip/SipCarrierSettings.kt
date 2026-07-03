@@ -84,6 +84,7 @@ data class SipCarrierPolicy(
     val fallbackEmergencyDialStrings: Set<String> = DEFAULT_FALLBACK_EMERGENCY_DIAL_STRINGS,
     val publicNumberNormalizationPolicy: SipPublicNumberNormalizationPolicy =
         SipPublicNumberNormalizationPolicy(),
+    val publicSipUriDomainOverride: String? = null,
     val registrationRecoveryPolicy: SipRegistrationRecoveryPolicy = SipRegistrationRecoveryPolicy(),
     val smsPolicy: SipSmsPolicy = SipSmsPolicy(),
     val inviteFailurePolicy: SipInviteFailurePolicy = SipInviteFailurePolicy(),
@@ -172,7 +173,8 @@ data class SipCarrierPolicy(
     fun publicSipUriForPhoneNumber(number: String, realm: String): String {
         val digits = number.trim()
         val user = if (digits.startsWith("+")) digits else "+$digits"
-        return "sip:$user@${phoneContextForLocalTelUri(realm)};user=phone"
+        val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
+        return "sip:$user@$domain;user=phone"
     }
 
     fun singtelSmsc(): String = SINGTEL_STOCK_SMSC
@@ -270,6 +272,11 @@ data class SipCarrierPolicy(
                         ),
                     outgoingPaniPolicy = OutgoingPaniPolicy.REGISTRATION_ACCESS_TECH,
                     outgoingInviteShape = OutgoingInviteShape.PUBLIC_SIP_URI_USER_PHONE,
+                    // REGISTER exposes the public IMPU in the Altel domain.
+                    // Use the same public domain for called-party SIP URIs;
+                    // Tele2 KZ rejects targets under the generic 3GPP realm
+                    // with "The called num is invalid."
+                    publicSipUriDomainOverride = "ims.altel4g.kz",
                 )
 
                 "450006" -> defaultFor(mcc, mnc).copy(
