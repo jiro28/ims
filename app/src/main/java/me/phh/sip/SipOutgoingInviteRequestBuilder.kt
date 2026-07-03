@@ -284,9 +284,45 @@ internal object SipOutgoingInviteRequestBuilder {
                     "carrier=${carrierSettings.mccMnc}",
             )
 
+            var localHeaders =
+                baseHeaders - "to" + mapOf("to" to listOf("<$localTargetUri>"))
+
+            if (carrierSettings.useTelPreferredIdentityOutgoingPolicy()) {
+                val preferredIdentityHeaderKey = listOf(
+                    "p-preferred-identity",
+                    "P-Preferred-Identity",
+                ).firstOrNull { key -> baseHeaders.containsKey(key) }
+                val telPreferredIdentity = preferredIdentityHeaderKey
+                    ?.let { key -> baseHeaders[key]?.firstOrNull() }
+                    ?.let { value ->
+                        Regex("<sip:(\\+?[0-9]+)@[^>]+>")
+                            .find(value)
+                            ?.groupValues
+                            ?.getOrNull(1)
+                            ?.let { number -> "<tel:$number>" }
+                    }
+
+                if (preferredIdentityHeaderKey != null && telPreferredIdentity != null) {
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy using TEL P-Preferred-Identity for " +
+                            "outgoing INVITE: ppi=$telPreferredIdentity " +
+                            "carrier=${carrierSettings.mccMnc}",
+                    )
+                    localHeaders = localHeaders - preferredIdentityHeaderKey +
+                        mapOf(preferredIdentityHeaderKey to listOf(telPreferredIdentity))
+                } else {
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy requested TEL P-Preferred-Identity but " +
+                            "no SIP identity could be converted",
+                    )
+                }
+            }
+
             return OutgoingInviteCarrierRequestShape(
                 targetUri = localTargetUri,
-                headers = baseHeaders - "to" + mapOf("to" to listOf("<$localTargetUri>")),
+                headers = localHeaders,
             )
         }
 

@@ -83,6 +83,8 @@ data class SipCarrierPolicy(
     val outgoingPaniPolicy: OutgoingPaniPolicy = OutgoingPaniPolicy.NONE,
     val outgoingPaniOverride: String? = null,
     val outgoingInviteShape: OutgoingInviteShape = OutgoingInviteShape.DEFAULT,
+    val outgoingPreferredIdentityPolicy: OutgoingPreferredIdentityPolicy =
+        OutgoingPreferredIdentityPolicy.DEFAULT,
     val securityClientAlgs: List<String> = DEFAULT_SECURITY_CLIENT_ALGS,
     val securityClientEalgs: List<String> = DEFAULT_SECURITY_CLIENT_EALGS,
     val fallbackEmergencyDialStrings: Set<String> = DEFAULT_FALLBACK_EMERGENCY_DIAL_STRINGS,
@@ -182,6 +184,9 @@ data class SipCarrierPolicy(
     fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
         outgoingInviteShape == OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT
 
+    fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
+        outgoingPreferredIdentityPolicy == OutgoingPreferredIdentityPolicy.TEL_URI
+
     fun publicSipUriForPhoneNumber(number: String, realm: String): String {
         val user = publicSipUriUserForPhoneNumber(number)
         val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
@@ -249,6 +254,11 @@ data class SipCarrierPolicy(
         LOCAL_TEL_PHONE_CONTEXT,
     }
 
+    enum class OutgoingPreferredIdentityPolicy {
+        DEFAULT,
+        TEL_URI,
+    }
+
     companion object {
         val DEFAULT_SECURITY_CLIENT_ALGS = listOf("hmac-sha-1-96", "hmac-md5-96")
         val DEFAULT_SECURITY_CLIENT_EALGS = listOf("null", "aes-cbc")
@@ -314,6 +324,11 @@ data class SipCarrierPolicy(
                     // with an OCS CCA failure when only access tech is sent.
                     // Try the same full E-UTRAN PANI shape used on reg-event.
                     outgoingPaniOverride = TELE2_KZ_FULL_EUTRAN_PANI,
+                    // Tele2 KZ reaches OCS with the local TEL target but still
+                    // fails charging. Try presenting own IMPU as a TEL URI
+                    // in P-Preferred-Identity instead of SIP URI.
+                    outgoingPreferredIdentityPolicy =
+                        OutgoingPreferredIdentityPolicy.TEL_URI,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
@@ -417,6 +432,9 @@ data class SipCarrierSettings(
 
     fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
         policy.useLocalTelPhoneContextOutgoingPolicy()
+
+    fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
+        policy.useTelPreferredIdentityOutgoingPolicy()
 
     fun publicSipUriForPhoneNumber(number: String, realm: String): String =
         policy.publicSipUriForPhoneNumber(number, realm)
