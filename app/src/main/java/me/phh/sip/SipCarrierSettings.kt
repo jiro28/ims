@@ -12,6 +12,9 @@ import android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_LTE
  * an XML/resource loader before the policy surface has stabilized.
  */
 
+private const val TELE2_KZ_FULL_EUTRAN_PANI =
+    "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=20810b8c49752501"
+
 data class SipRegistrationRecoveryPolicy(
     val blockPcscfOnRegistrationFailure: Boolean = true,
     val pcscfBlockMs: Long = 30_000L,
@@ -78,6 +81,7 @@ data class SipCarrierPolicy(
     val plainTelShortCodes: Set<String> = emptySet(),
     val plainTelAllLocalShortCodes: Boolean = false,
     val outgoingPaniPolicy: OutgoingPaniPolicy = OutgoingPaniPolicy.NONE,
+    val outgoingPaniOverride: String? = null,
     val outgoingInviteShape: OutgoingInviteShape = OutgoingInviteShape.DEFAULT,
     val securityClientAlgs: List<String> = DEFAULT_SECURITY_CLIENT_ALGS,
     val securityClientEalgs: List<String> = DEFAULT_SECURITY_CLIENT_EALGS,
@@ -125,6 +129,10 @@ data class SipCarrierPolicy(
     }
 
     fun outgoingPaniHeaders(registrationTech: Int): SipHeadersMap {
+        outgoingPaniOverride?.takeIf { it.isNotBlank() }?.let { pani ->
+            return mapOf("P-Access-Network-Info" to listOf(pani))
+        }
+
         if (outgoingPaniPolicy != OutgoingPaniPolicy.REGISTRATION_ACCESS_TECH) {
             return emptyMap()
         }
@@ -302,6 +310,10 @@ data class SipCarrierPolicy(
                             kazakhstanMobileWithoutCountryCode = true,
                         ),
                     outgoingPaniPolicy = OutgoingPaniPolicy.REGISTRATION_ACCESS_TECH,
+                    // Tele2 KZ rejects local-TEL INVITEs after number validation
+                    // with an OCS CCA failure when only access tech is sent.
+                    // Try the same full E-UTRAN PANI shape used on reg-event.
+                    outgoingPaniOverride = TELE2_KZ_FULL_EUTRAN_PANI,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
