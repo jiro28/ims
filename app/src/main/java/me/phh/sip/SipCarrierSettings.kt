@@ -85,6 +85,8 @@ data class SipCarrierPolicy(
     val outgoingInviteShape: OutgoingInviteShape = OutgoingInviteShape.DEFAULT,
     val outgoingPreferredIdentityPolicy: OutgoingPreferredIdentityPolicy =
         OutgoingPreferredIdentityPolicy.DEFAULT,
+    val outgoingFromIdentityPolicy: OutgoingFromIdentityPolicy =
+        OutgoingFromIdentityPolicy.DEFAULT,
     val securityClientAlgs: List<String> = DEFAULT_SECURITY_CLIENT_ALGS,
     val securityClientEalgs: List<String> = DEFAULT_SECURITY_CLIENT_EALGS,
     val fallbackEmergencyDialStrings: Set<String> = DEFAULT_FALLBACK_EMERGENCY_DIAL_STRINGS,
@@ -187,6 +189,9 @@ data class SipCarrierPolicy(
     fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
         outgoingPreferredIdentityPolicy == OutgoingPreferredIdentityPolicy.TEL_URI
 
+    fun useTelFromIdentityOutgoingPolicy(): Boolean =
+        outgoingFromIdentityPolicy == OutgoingFromIdentityPolicy.TEL_URI
+
     fun publicSipUriForPhoneNumber(number: String, realm: String): String {
         val user = publicSipUriUserForPhoneNumber(number)
         val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
@@ -255,6 +260,11 @@ data class SipCarrierPolicy(
     }
 
     enum class OutgoingPreferredIdentityPolicy {
+        DEFAULT,
+        TEL_URI,
+    }
+
+    enum class OutgoingFromIdentityPolicy {
         DEFAULT,
         TEL_URI,
     }
@@ -329,6 +339,10 @@ data class SipCarrierPolicy(
                     // in P-Preferred-Identity instead of SIP URI.
                     outgoingPreferredIdentityPolicy =
                         OutgoingPreferredIdentityPolicy.TEL_URI,
+                    // TEL PPI still reaches OCS but fails charging. Try a
+                    // matching TEL From identity while preserving the tag.
+                    outgoingFromIdentityPolicy =
+                        OutgoingFromIdentityPolicy.TEL_URI,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
@@ -435,6 +449,9 @@ data class SipCarrierSettings(
 
     fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
         policy.useTelPreferredIdentityOutgoingPolicy()
+
+    fun useTelFromIdentityOutgoingPolicy(): Boolean =
+        policy.useTelFromIdentityOutgoingPolicy()
 
     fun publicSipUriForPhoneNumber(number: String, realm: String): String =
         policy.publicSipUriForPhoneNumber(number, realm)

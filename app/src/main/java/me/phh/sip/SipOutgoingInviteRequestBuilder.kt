@@ -320,6 +320,39 @@ internal object SipOutgoingInviteRequestBuilder {
                 }
             }
 
+            if (carrierSettings.useTelFromIdentityOutgoingPolicy()) {
+                val fromHeaderKey = listOf(
+                    "from",
+                    "From",
+                ).firstOrNull { key -> localHeaders.containsKey(key) }
+                val telFromIdentity = fromHeaderKey
+                    ?.let { key -> localHeaders[key]?.firstOrNull() }
+                    ?.let { value ->
+                        Regex("^\\s*<sip:(\\+?[0-9]+)@[^>]+>(.*)$")
+                            .find(value)
+                            ?.let { match ->
+                                "<tel:${match.groupValues[1]}>${match.groupValues[2]}"
+                            }
+                    }
+
+                if (fromHeaderKey != null && telFromIdentity != null) {
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy using TEL From identity for " +
+                            "outgoing INVITE: from=$telFromIdentity " +
+                            "carrier=${carrierSettings.mccMnc}",
+                    )
+                    localHeaders = localHeaders - fromHeaderKey +
+                        mapOf(fromHeaderKey to listOf(telFromIdentity))
+                } else {
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy requested TEL From identity but " +
+                            "no SIP identity could be converted",
+                    )
+                }
+            }
+
             return OutgoingInviteCarrierRequestShape(
                 targetUri = localTargetUri,
                 headers = localHeaders,
