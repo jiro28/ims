@@ -85,6 +85,7 @@ data class SipCarrierPolicy(
     val publicNumberNormalizationPolicy: SipPublicNumberNormalizationPolicy =
         SipPublicNumberNormalizationPolicy(),
     val publicSipUriDomainOverride: String? = null,
+    val publicSipUriUseKazakhstanNationalNumber: Boolean = false,
     val registrationRecoveryPolicy: SipRegistrationRecoveryPolicy = SipRegistrationRecoveryPolicy(),
     val smsPolicy: SipSmsPolicy = SipSmsPolicy(),
     val inviteFailurePolicy: SipInviteFailurePolicy = SipInviteFailurePolicy(),
@@ -171,10 +172,30 @@ data class SipCarrierPolicy(
         outgoingInviteShape == OutgoingInviteShape.PUBLIC_SIP_URI_USER_PHONE
 
     fun publicSipUriForPhoneNumber(number: String, realm: String): String {
-        val digits = number.trim()
-        val user = if (digits.startsWith("+")) digits else "+$digits"
+        val user = publicSipUriUserForPhoneNumber(number)
         val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
         return "sip:$user@$domain;user=phone"
+    }
+
+    private fun publicSipUriUserForPhoneNumber(number: String): String {
+        val digits = number.trim()
+
+        if (publicSipUriUseKazakhstanNationalNumber) {
+            when {
+                // Public E.164 +7 mobile number, for example +77000000001.
+                digits.length == 12 && digits.startsWith("+7") ->
+                    return digits.drop(2)
+
+                // Kazakhstan trunk-prefix form, for example 87000000001.
+                digits.length == 11 && digits.startsWith("8") &&
+                    digits.drop(1).startsWith("7") -> return digits.drop(1)
+
+                // Already in IMS-local 10-digit form, for example 7000000001.
+                digits.length == 10 && digits.startsWith("7") -> return digits
+            }
+        }
+
+        return if (digits.startsWith("+")) digits else "+$digits"
     }
 
     fun singtelSmsc(): String = SINGTEL_STOCK_SMSC
@@ -277,6 +298,11 @@ data class SipCarrierPolicy(
                     // Tele2 KZ rejects targets under the generic 3GPP realm
                     // with "The called num is invalid."
                     publicSipUriDomainOverride = "ims.altel4g.kz",
+                    // Tele2 KZ still rejects +7 called-party SIP users as
+                    // invalid. Incoming HD caller IDs arrive in the IMS-local
+                    // 10-digit form, so try the same user part for outbound
+                    // Request-URI/To while keeping framework numbers E.164.
+                    publicSipUriUseKazakhstanNationalNumber = true,
                 )
 
                 "450006" -> defaultFor(mcc, mnc).copy(
