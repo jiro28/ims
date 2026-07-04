@@ -189,6 +189,9 @@ data class SipCarrierPolicy(
     fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
         outgoingPreferredIdentityPolicy == OutgoingPreferredIdentityPolicy.TEL_URI
 
+    fun omitPreferredIdentityOutgoingPolicy(): Boolean =
+        outgoingPreferredIdentityPolicy == OutgoingPreferredIdentityPolicy.OMIT
+
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         outgoingFromIdentityPolicy == OutgoingFromIdentityPolicy.TEL_URI
 
@@ -262,6 +265,7 @@ data class SipCarrierPolicy(
     enum class OutgoingPreferredIdentityPolicy {
         DEFAULT,
         TEL_URI,
+        OMIT,
     }
 
     enum class OutgoingFromIdentityPolicy {
@@ -337,12 +341,11 @@ data class SipCarrierPolicy(
                     // Tele2 KZ reaches OCS with the local TEL target but still
                     // fails charging. Try presenting own IMPU as a TEL URI
                     // in P-Preferred-Identity instead of SIP URI.
-                    outgoingPreferredIdentityPolicy =
-                        OutgoingPreferredIdentityPolicy.TEL_URI,
+                    outgoingPreferredIdentityPolicy = OutgoingPreferredIdentityPolicy.OMIT,
                     // TEL PPI still reaches OCS but fails charging. Try a
                     // matching TEL From identity while preserving the tag.
                     outgoingFromIdentityPolicy =
-                        OutgoingFromIdentityPolicy.TEL_URI,
+                        OutgoingFromIdentityPolicy.DEFAULT,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
@@ -449,6 +452,9 @@ data class SipCarrierSettings(
 
     fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
         policy.useTelPreferredIdentityOutgoingPolicy()
+
+    fun omitPreferredIdentityOutgoingPolicy(): Boolean =
+        policy.omitPreferredIdentityOutgoingPolicy()
 
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         policy.useTelFromIdentityOutgoingPolicy()

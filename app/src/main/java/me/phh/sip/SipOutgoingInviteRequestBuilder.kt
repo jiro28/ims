@@ -353,6 +353,28 @@ internal object SipOutgoingInviteRequestBuilder {
                 }
             }
 
+            if (carrierSettings.omitPreferredIdentityOutgoingPolicy()) {
+                val preferredIdentityHeaderKey = listOf(
+                    "p-preferred-identity",
+                    "P-Preferred-Identity",
+                ).firstOrNull { key -> localHeaders.containsKey(key) }
+
+                if (preferredIdentityHeaderKey != null) {
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy omitting P-Preferred-Identity for " +
+                            "outgoing INVITE: carrier=${carrierSettings.mccMnc}",
+                    )
+                    localHeaders = localHeaders - preferredIdentityHeaderKey
+                } else {
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy requested omitted P-Preferred-Identity " +
+                            "but no header was present carrier=${carrierSettings.mccMnc}",
+                    )
+                }
+            }
+
             return OutgoingInviteCarrierRequestShape(
                 targetUri = localTargetUri,
                 headers = localHeaders,
