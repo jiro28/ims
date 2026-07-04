@@ -4342,12 +4342,24 @@ fun onWfcDisabled(reason: String) {
     private fun buildOutgoingInviteSdpOffer(
         rtpSocket: DatagramSocket,
     ): OutgoingInviteSdpOffer {
+        val outgoingAmrWbMediaCodecAvailable =
+            if (carrierSettings.forceAmrNbOnlyOutgoingOffer()) {
+                Rlog.w(
+                    TAG,
+                    "Carrier-policy forcing AMR-NB-only outgoing SDP offer: " +
+                        "carrier=${carrierSettings.mccMnc}",
+                )
+                false
+            } else {
+                amrWbMediaCodecAvailable
+            }
+
         return SipOutgoingInviteSdp.build(
             logTag = TAG,
             rtpSocket = rtpSocket,
             localHost = "${socket.gLocalAddr().hostAddress}",
             ipType = if (localAddr is Inet6Address) "IP6" else "IP4",
-            amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
+            amrWbMediaCodecAvailable = outgoingAmrWbMediaCodecAvailable,
             singtelStockOutgoingCarrier = useSingTelStockOutgoingPolicy(),
         )
     }

@@ -83,6 +83,8 @@ data class SipCarrierPolicy(
     val outgoingPaniPolicy: OutgoingPaniPolicy = OutgoingPaniPolicy.NONE,
     val outgoingPaniOverride: String? = null,
     val outgoingInviteShape: OutgoingInviteShape = OutgoingInviteShape.DEFAULT,
+    val outgoingCodecOfferPolicy: OutgoingCodecOfferPolicy =
+        OutgoingCodecOfferPolicy.DEFAULT,
     val outgoingPreferredIdentityPolicy: OutgoingPreferredIdentityPolicy =
         OutgoingPreferredIdentityPolicy.DEFAULT,
     val outgoingFromIdentityPolicy: OutgoingFromIdentityPolicy =
@@ -192,6 +194,9 @@ data class SipCarrierPolicy(
     fun omitPreferredIdentityOutgoingPolicy(): Boolean =
         outgoingPreferredIdentityPolicy == OutgoingPreferredIdentityPolicy.OMIT
 
+    fun forceAmrNbOnlyOutgoingOffer(): Boolean =
+        outgoingCodecOfferPolicy == OutgoingCodecOfferPolicy.AMR_NB_ONLY
+
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         outgoingFromIdentityPolicy == OutgoingFromIdentityPolicy.TEL_URI
 
@@ -260,6 +265,11 @@ data class SipCarrierPolicy(
         SINGTEL_COMPACT_STOCK,
         PUBLIC_SIP_URI_USER_PHONE,
         LOCAL_TEL_PHONE_CONTEXT,
+    }
+
+    enum class OutgoingCodecOfferPolicy {
+        DEFAULT,
+        AMR_NB_ONLY,
     }
 
     enum class OutgoingPreferredIdentityPolicy {
@@ -346,6 +356,10 @@ data class SipCarrierPolicy(
                     // matching TEL From identity while preserving the tag.
                     outgoingFromIdentityPolicy =
                         OutgoingFromIdentityPolicy.DEFAULT,
+                    // URI/identity/PANI tests still reach OCS but fail.
+                    // Try a narrowband-only outgoing SDP offer.
+                    outgoingCodecOfferPolicy =
+                        OutgoingCodecOfferPolicy.AMR_NB_ONLY,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
@@ -455,6 +469,9 @@ data class SipCarrierSettings(
 
     fun omitPreferredIdentityOutgoingPolicy(): Boolean =
         policy.omitPreferredIdentityOutgoingPolicy()
+
+    fun forceAmrNbOnlyOutgoingOffer(): Boolean =
+        policy.forceAmrNbOnlyOutgoingOffer()
 
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         policy.useTelFromIdentityOutgoingPolicy()
