@@ -96,6 +96,7 @@ data class SipCarrierPolicy(
         SipPublicNumberNormalizationPolicy(),
     val publicSipUriDomainOverride: String? = null,
     val publicSipUriUseKazakhstanNationalNumber: Boolean = false,
+    val localTelPhoneContextUseTrunkPrefix: Boolean = false,
     val registrationRecoveryPolicy: SipRegistrationRecoveryPolicy = SipRegistrationRecoveryPolicy(),
     val smsPolicy: SipSmsPolicy = SipSmsPolicy(),
     val inviteFailurePolicy: SipInviteFailurePolicy = SipInviteFailurePolicy(),
@@ -188,6 +189,9 @@ data class SipCarrierPolicy(
     fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
         outgoingInviteShape == OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT
 
+    fun useLocalTrunkTelPhoneContextOutgoingPolicy(): Boolean =
+        outgoingInviteShape == OutgoingInviteShape.LOCAL_TRUNK_TEL_PHONE_CONTEXT
+
     fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
         outgoingPreferredIdentityPolicy == OutgoingPreferredIdentityPolicy.TEL_URI
 
@@ -207,9 +211,22 @@ data class SipCarrierPolicy(
     }
 
     fun localTelPhoneContextUriForPhoneNumber(number: String, realm: String): String {
-        val user = publicSipUriUserForPhoneNumber(number)
+        val localUser = publicSipUriUserForPhoneNumber(number)
+        val user = if (localTelPhoneContextUseTrunkPrefix &&
+            localUser.length == 10 && localUser.startsWith("7")) {
+            "8$localUser"
+        } else {
+            localUser
+        }
         val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
         return "tel:$user;phone-context=$domain"
+    }
+
+    fun localTrunkTelPhoneContextUriForPhoneNumber(number: String, realm: String): String {
+        val user = publicSipUriUserForPhoneNumber(number)
+        val trunkUser = if (user.length == 10 && user.startsWith("7")) "8$user" else user
+        val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
+        return "tel:$trunkUser;phone-context=$domain"
     }
 
     private fun publicSipUriUserForPhoneNumber(number: String): String {
@@ -265,6 +282,7 @@ data class SipCarrierPolicy(
         SINGTEL_COMPACT_STOCK,
         PUBLIC_SIP_URI_USER_PHONE,
         LOCAL_TEL_PHONE_CONTEXT,
+        LOCAL_TRUNK_TEL_PHONE_CONTEXT,
     }
 
     enum class OutgoingCodecOfferPolicy {
@@ -361,6 +379,9 @@ data class SipCarrierPolicy(
                     outgoingCodecOfferPolicy =
                         OutgoingCodecOfferPolicy.AMR_NB_ONLY,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
+                    // Test national trunk-prefix TEL user for the local phone-context target.
+                    // Expected target: tel:87000000001;phone-context=ims.altel4g.kz
+                    localTelPhoneContextUseTrunkPrefix = true,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
                     // Tele2 KZ rejects targets under the generic 3GPP realm
@@ -464,6 +485,9 @@ data class SipCarrierSettings(
     fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
         policy.useLocalTelPhoneContextOutgoingPolicy()
 
+    fun useLocalTrunkTelPhoneContextOutgoingPolicy(): Boolean =
+        policy.useLocalTrunkTelPhoneContextOutgoingPolicy()
+
     fun useTelPreferredIdentityOutgoingPolicy(): Boolean =
         policy.useTelPreferredIdentityOutgoingPolicy()
 
@@ -481,6 +505,9 @@ data class SipCarrierSettings(
 
     fun localTelPhoneContextUriForPhoneNumber(number: String, realm: String): String =
         policy.localTelPhoneContextUriForPhoneNumber(number, realm)
+
+    fun localTrunkTelPhoneContextUriForPhoneNumber(number: String, realm: String): String =
+        policy.localTrunkTelPhoneContextUriForPhoneNumber(number, realm)
 
     fun singtelSmsc(): String =
         policy.singtelSmsc()
