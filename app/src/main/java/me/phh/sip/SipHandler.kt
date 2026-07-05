@@ -4354,6 +4354,16 @@ fun onWfcDisabled(reason: String) {
                 amrWbMediaCodecAvailable
             }
 
+        val outgoingOfferPrecondition =
+            !carrierSettings.omitOutgoingInvitePreconditionPolicy()
+        if (!outgoingOfferPrecondition) {
+            Rlog.w(
+                TAG,
+                "Carrier-policy omitting outgoing SDP precondition/QoS offer: " +
+                    "carrier=${carrierSettings.mccMnc}",
+            )
+        }
+
         return SipOutgoingInviteSdp.build(
             logTag = TAG,
             rtpSocket = rtpSocket,
@@ -4361,6 +4371,7 @@ fun onWfcDisabled(reason: String) {
             ipType = if (localAddr is Inet6Address) "IP6" else "IP4",
             amrWbMediaCodecAvailable = outgoingAmrWbMediaCodecAvailable,
             singtelStockOutgoingCarrier = useSingTelStockOutgoingPolicy(),
+            offerPrecondition = outgoingOfferPrecondition,
         )
     }
 

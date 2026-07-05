@@ -85,6 +85,7 @@ data class SipCarrierPolicy(
     val outgoingInviteShape: OutgoingInviteShape = OutgoingInviteShape.DEFAULT,
     val outgoingCodecOfferPolicy: OutgoingCodecOfferPolicy =
         OutgoingCodecOfferPolicy.DEFAULT,
+    val omitOutgoingInvitePrecondition: Boolean = false,
     val outgoingPreferredIdentityPolicy: OutgoingPreferredIdentityPolicy =
         OutgoingPreferredIdentityPolicy.DEFAULT,
     val outgoingFromIdentityPolicy: OutgoingFromIdentityPolicy =
@@ -205,6 +206,9 @@ data class SipCarrierPolicy(
 
     fun forceAmrNbOnlyOutgoingOffer(): Boolean =
         outgoingCodecOfferPolicy == OutgoingCodecOfferPolicy.AMR_NB_ONLY
+
+    fun omitOutgoingInvitePreconditionPolicy(): Boolean =
+        omitOutgoingInvitePrecondition
 
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         outgoingFromIdentityPolicy == OutgoingFromIdentityPolicy.TEL_URI
@@ -385,6 +389,9 @@ data class SipCarrierPolicy(
                     // Try a narrowband-only outgoing SDP offer.
                     outgoingCodecOfferPolicy =
                         OutgoingCodecOfferPolicy.AMR_NB_ONLY,
+                    // Previous URI, identity, PANI and codec variants still fail at OCS.
+                    // Test a plain SDP offer without RFC3312 QoS/precondition.
+                    omitOutgoingInvitePrecondition = true,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // Test originating identity using the 3GPP associated URI.
                     // Expected From/PPI: sip:+own@ims.mnc077.mcc401.3gppnetwork.org;user=phone
@@ -512,6 +519,9 @@ data class SipCarrierSettings(
 
     fun forceAmrNbOnlyOutgoingOffer(): Boolean =
         policy.forceAmrNbOnlyOutgoingOffer()
+
+    fun omitOutgoingInvitePreconditionPolicy(): Boolean =
+        policy.omitOutgoingInvitePreconditionPolicy()
 
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         policy.useTelFromIdentityOutgoingPolicy()

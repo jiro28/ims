@@ -153,6 +153,17 @@ internal object SipOutgoingInviteRequestBuilder {
             """<sip:$myTel@$localEndpoint;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
         val carrierPaniHeaders = carrierSettings.outgoingPaniHeaders(registrationTech)
 
+        val supportedHeader = if (carrierSettings.omitOutgoingInvitePreconditionPolicy()) {
+            Rlog.w(
+                logTag,
+                "Carrier-policy omitting outgoing INVITE precondition support: " +
+                    "carrier=${carrierSettings.mccMnc}",
+            )
+            "100rel, replaces, timer"
+        } else {
+            "100rel, replaces, timer, precondition"
+        }
+
         val myHeaders = commonHeaders +
             """
                 From: <$mySip>
@@ -166,7 +177,7 @@ internal object SipOutgoingInviteRequestBuilder {
                 P-Early-Media: supported
                 Content-Type: application/sdp
                 Session-Expires: $sessionExpiresSeconds
-                Supported: 100rel, replaces, timer, precondition
+                Supported: $supportedHeader
                 Accept: application/sdp
                 Min-SE: $minSeSeconds
                 Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
