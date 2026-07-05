@@ -97,6 +97,7 @@ data class SipCarrierPolicy(
     val publicSipUriDomainOverride: String? = null,
     val publicSipUriUseKazakhstanNationalNumber: Boolean = false,
     val localTelPhoneContextUseTrunkPrefix: Boolean = false,
+    val localTelPhoneContextOverride: String? = null,
     val registrationRecoveryPolicy: SipRegistrationRecoveryPolicy = SipRegistrationRecoveryPolicy(),
     val smsPolicy: SipSmsPolicy = SipSmsPolicy(),
     val inviteFailurePolicy: SipInviteFailurePolicy = SipInviteFailurePolicy(),
@@ -218,8 +219,10 @@ data class SipCarrierPolicy(
         } else {
             localUser
         }
-        val domain = publicSipUriDomainOverride ?: phoneContextForLocalTelUri(realm)
-        return "tel:$user;phone-context=$domain"
+        val context = localTelPhoneContextOverride
+            ?: publicSipUriDomainOverride
+            ?: phoneContextForLocalTelUri(realm)
+        return "tel:$user;phone-context=$context"
     }
 
     fun localTrunkTelPhoneContextUriForPhoneNumber(number: String, realm: String): String {
@@ -379,6 +382,9 @@ data class SipCarrierPolicy(
                     outgoingCodecOfferPolicy =
                         OutgoingCodecOfferPolicy.AMR_NB_ONLY,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
+                    // Test global-prefix TEL phone-context.
+                    // Expected target: tel:7000000001;phone-context=+7
+                    localTelPhoneContextOverride = "+7",
                     // Test national trunk-prefix TEL user for the local phone-context target.
                     // Expected target: tel:7000000001;phone-context=ims.mnc077.mcc401.3gppnetwork.org
                     localTelPhoneContextUseTrunkPrefix = false,
