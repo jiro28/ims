@@ -375,6 +375,57 @@ internal object SipOutgoingInviteRequestBuilder {
                 }
             }
 
+            if (carrierSettings.use3gppRealmIdentityForInviteOutgoingPolicy()) {
+                val fromHeaderKey = listOf(
+                    "from",
+                    "From",
+                ).firstOrNull { key -> localHeaders.containsKey(key) }
+                val preferredIdentityHeaderKey = listOf(
+                    "p-preferred-identity",
+                    "P-Preferred-Identity",
+                ).firstOrNull { key -> localHeaders.containsKey(key) }
+                    ?: "p-preferred-identity"
+
+                val ownNumber = fromHeaderKey
+                    ?.let { key -> localHeaders[key]?.firstOrNull() }
+                    ?.let { value ->
+                        Regex("<sip:(\\+?[0-9]+)@[^>]+>")
+                            .find(value)
+                            ?.groupValues
+                            ?.getOrNull(1)
+                    }
+
+                if (fromHeaderKey != null && ownNumber != null) {
+                    val realmIdentity = "<sip:$ownNumber@$realm;user=phone>"
+                    val realmFromIdentity = localHeaders[fromHeaderKey]
+                        ?.firstOrNull()
+                        ?.let { value ->
+                            Regex("^\\s*<sip:\\+?[0-9]+@[^>]+>(.*)$")
+                                .find(value)
+                                ?.let { match -> realmIdentity + match.groupValues[1] }
+                        }
+                        ?: realmIdentity
+
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy using 3GPP realm origin identity for " +
+                            "outgoing INVITE: from=$realmFromIdentity " +
+                            "ppi=$realmIdentity carrier=${carrierSettings.mccMnc}",
+                    )
+
+                    localHeaders = localHeaders - fromHeaderKey +
+                        mapOf(fromHeaderKey to listOf(realmFromIdentity))
+                    localHeaders = localHeaders - preferredIdentityHeaderKey +
+                        mapOf(preferredIdentityHeaderKey to listOf(realmIdentity))
+                } else {
+                    Rlog.w(
+                        logTag,
+                        "Carrier-policy requested 3GPP realm origin identity but " +
+                            "no SIP From identity could be converted",
+                    )
+                }
+            }
+
             return OutgoingInviteCarrierRequestShape(
                 targetUri = localTargetUri,
                 headers = localHeaders,

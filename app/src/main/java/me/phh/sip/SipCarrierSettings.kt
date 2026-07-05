@@ -98,6 +98,7 @@ data class SipCarrierPolicy(
     val publicSipUriUseKazakhstanNationalNumber: Boolean = false,
     val localTelPhoneContextUseTrunkPrefix: Boolean = false,
     val localTelPhoneContextOverride: String? = null,
+    val outgoingUse3gppRealmIdentityForInvite: Boolean = false,
     val registrationRecoveryPolicy: SipRegistrationRecoveryPolicy = SipRegistrationRecoveryPolicy(),
     val smsPolicy: SipSmsPolicy = SipSmsPolicy(),
     val inviteFailurePolicy: SipInviteFailurePolicy = SipInviteFailurePolicy(),
@@ -189,6 +190,9 @@ data class SipCarrierPolicy(
 
     fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
         outgoingInviteShape == OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT
+
+    fun use3gppRealmIdentityForInviteOutgoingPolicy(): Boolean =
+        outgoingUse3gppRealmIdentityForInvite
 
     fun useLocalTrunkTelPhoneContextOutgoingPolicy(): Boolean =
         outgoingInviteShape == OutgoingInviteShape.LOCAL_TRUNK_TEL_PHONE_CONTEXT
@@ -382,6 +386,9 @@ data class SipCarrierPolicy(
                     outgoingCodecOfferPolicy =
                         OutgoingCodecOfferPolicy.AMR_NB_ONLY,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
+                    // Test originating identity using the 3GPP associated URI.
+                    // Expected From/PPI: sip:+own@ims.mnc077.mcc401.3gppnetwork.org;user=phone
+                    outgoingUse3gppRealmIdentityForInvite = true,
                     // Test global-prefix TEL phone-context.
                     // Expected target: tel:7000000001;phone-context=+7
                     localTelPhoneContextOverride = "+7",
@@ -490,6 +497,9 @@ data class SipCarrierSettings(
 
     fun useLocalTelPhoneContextOutgoingPolicy(): Boolean =
         policy.useLocalTelPhoneContextOutgoingPolicy()
+
+    fun use3gppRealmIdentityForInviteOutgoingPolicy(): Boolean =
+        policy.use3gppRealmIdentityForInviteOutgoingPolicy()
 
     fun useLocalTrunkTelPhoneContextOutgoingPolicy(): Boolean =
         policy.useLocalTrunkTelPhoneContextOutgoingPolicy()
