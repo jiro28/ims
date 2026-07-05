@@ -380,13 +380,13 @@ data class SipCarrierPolicy(
                         OutgoingCodecOfferPolicy.AMR_NB_ONLY,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
                     // Test national trunk-prefix TEL user for the local phone-context target.
-                    // Expected target: tel:87000000001;phone-context=ims.altel4g.kz
-                    localTelPhoneContextUseTrunkPrefix = true,
+                    // Expected target: tel:7000000001;phone-context=ims.mnc077.mcc401.3gppnetwork.org
+                    localTelPhoneContextUseTrunkPrefix = false,
                     // REGISTER exposes the public IMPU in the Altel domain.
                     // Use the same public domain for called-party SIP URIs;
                     // Tele2 KZ rejects targets under the generic 3GPP realm
                     // with "The called num is invalid."
-                    publicSipUriDomainOverride = "ims.altel4g.kz",
+                    publicSipUriDomainOverride = null,
                     // Tele2 KZ still rejects +7 called-party SIP users as
                     // invalid. Incoming HD caller IDs arrive in the IMS-local
                     // 10-digit form, so try the same user part for outbound
