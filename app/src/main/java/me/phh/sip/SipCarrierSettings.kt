@@ -86,6 +86,7 @@ data class SipCarrierPolicy(
     val outgoingCodecOfferPolicy: OutgoingCodecOfferPolicy =
         OutgoingCodecOfferPolicy.DEFAULT,
     val omitOutgoingInvitePrecondition: Boolean = false,
+    val explicitOutgoingRtcpAttribute: Boolean = false,
     val outgoingPreferredIdentityPolicy: OutgoingPreferredIdentityPolicy =
         OutgoingPreferredIdentityPolicy.DEFAULT,
     val outgoingFromIdentityPolicy: OutgoingFromIdentityPolicy =
@@ -209,6 +210,9 @@ data class SipCarrierPolicy(
 
     fun omitOutgoingInvitePreconditionPolicy(): Boolean =
         omitOutgoingInvitePrecondition
+
+    fun useExplicitOutgoingRtcpAttributePolicy(): Boolean =
+        explicitOutgoingRtcpAttribute
 
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         outgoingFromIdentityPolicy == OutgoingFromIdentityPolicy.TEL_URI
@@ -380,7 +384,7 @@ data class SipCarrierPolicy(
                     // Tele2 KZ reaches OCS with the local TEL target but still
                     // fails charging. Try presenting own IMPU as a TEL URI
                     // in P-Preferred-Identity instead of SIP URI.
-                    outgoingPreferredIdentityPolicy = OutgoingPreferredIdentityPolicy.OMIT,
+                    outgoingPreferredIdentityPolicy = OutgoingPreferredIdentityPolicy.DEFAULT,
                     // TEL PPI still reaches OCS but fails charging. Try a
                     // matching TEL From identity while preserving the tag.
                     outgoingFromIdentityPolicy =
@@ -388,14 +392,17 @@ data class SipCarrierPolicy(
                     // URI/identity/PANI tests still reach OCS but fail.
                     // Try a narrowband-only outgoing SDP offer.
                     outgoingCodecOfferPolicy =
-                        OutgoingCodecOfferPolicy.AMR_NB_ONLY,
+                        OutgoingCodecOfferPolicy.DEFAULT,
                     // Previous URI, identity, PANI and codec variants still fail at OCS.
                     // Test a plain SDP offer without RFC3312 QoS/precondition.
-                    omitOutgoingInvitePrecondition = true,
+                    omitOutgoingInvitePrecondition = false,
                     outgoingInviteShape = OutgoingInviteShape.LOCAL_TEL_PHONE_CONTEXT,
+                    // Stock-ish media test after URI/identity variants still hit OCS.
+                    // Keep local TEL routing, restore normal SDP, and advertise RTCP.
+                    explicitOutgoingRtcpAttribute = true,
                     // Test originating identity using the 3GPP associated URI.
                     // Expected From/PPI: sip:+own@ims.mnc077.mcc401.3gppnetwork.org;user=phone
-                    outgoingUse3gppRealmIdentityForInvite = true,
+                    outgoingUse3gppRealmIdentityForInvite = false,
                     // Test global-prefix TEL phone-context.
                     // Expected target: tel:7000000001;phone-context=+7
                     localTelPhoneContextOverride = "+7",
@@ -522,6 +529,9 @@ data class SipCarrierSettings(
 
     fun omitOutgoingInvitePreconditionPolicy(): Boolean =
         policy.omitOutgoingInvitePreconditionPolicy()
+
+    fun useExplicitOutgoingRtcpAttributePolicy(): Boolean =
+        policy.useExplicitOutgoingRtcpAttributePolicy()
 
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         policy.useTelFromIdentityOutgoingPolicy()

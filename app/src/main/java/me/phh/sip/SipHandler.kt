@@ -4372,6 +4372,7 @@ fun onWfcDisabled(reason: String) {
             amrWbMediaCodecAvailable = outgoingAmrWbMediaCodecAvailable,
             singtelStockOutgoingCarrier = useSingTelStockOutgoingPolicy(),
             offerPrecondition = outgoingOfferPrecondition,
+            explicitRtcpAttribute = carrierSettings.useExplicitOutgoingRtcpAttributePolicy(),
         )
     }
 

@@ -29,11 +29,19 @@ internal object SipOutgoingInviteSdp {
         amrWbMediaCodecAvailable: Boolean,
         singtelStockOutgoingCarrier: Boolean,
         offerPrecondition: Boolean = true,
+        explicitRtcpAttribute: Boolean = false,
     ): OutgoingInviteSdpOffer {
         val mediaOffer = buildMediaOffer(
             logTag = logTag,
             amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
         )
+        if (explicitRtcpAttribute) {
+            Rlog.w(
+                logTag,
+                "Carrier-policy advertising explicit outgoing RTCP SDP attribute: " +
+                    "rtpPort=${rtpSocket.localPort} rtcpPort=${rtpSocket.localPort + 1}",
+            )
+        }
         val genericSdp = buildGenericBody(
             rtpSocket = rtpSocket,
             mediaOffer = mediaOffer,
@@ -41,6 +49,7 @@ internal object SipOutgoingInviteSdp {
             localHost = localHost,
             singtelStockOutgoingCarrier = singtelStockOutgoingCarrier,
             offerPrecondition = offerPrecondition,
+            explicitRtcpAttribute = explicitRtcpAttribute,
         )
         val singtelCompactSdp = buildSingTelCompactBody(
             rtpSocket = rtpSocket,
@@ -105,6 +114,7 @@ internal object SipOutgoingInviteSdp {
         localHost: String,
         singtelStockOutgoingCarrier: Boolean,
         offerPrecondition: Boolean,
+        explicitRtcpAttribute: Boolean,
     ): ByteArray {
         val amrNbTrack = mediaOffer.amrNbTrack
         val amrWbTrack = mediaOffer.amrWbTrack
@@ -130,6 +140,9 @@ internal object SipOutgoingInviteSdp {
             "a=ptime:20",
             "a=maxptime:240",
         )
+        if (explicitRtcpAttribute) {
+            sdpLines += "a=rtcp:${rtpSocket.localPort + 1}"
+        }
         if (offerAmrWb) {
             sdpLines += listOf(
                 "a=rtpmap:$amrWbTrack AMR-WB/16000",
