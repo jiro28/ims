@@ -164,6 +164,16 @@ internal object SipOutgoingInviteRequestBuilder {
             "100rel, replaces, timer, precondition"
         }
 
+        val outgoingUserAgent = carrierSettings.outgoingUserAgentOverridePolicy()
+            ?.also { userAgent ->
+                Rlog.w(
+                    logTag,
+                    "Carrier-policy overriding outgoing INVITE User-Agent: " +
+                        "carrier=${carrierSettings.mccMnc} userAgent=$userAgent",
+                )
+            }
+            ?: "SM-A546B-YY Samsung IMS 7.0"
+
         val myHeaders = commonHeaders +
             """
                 From: <$mySip>
@@ -178,6 +188,7 @@ internal object SipOutgoingInviteRequestBuilder {
                 Content-Type: application/sdp
                 Session-Expires: $sessionExpiresSeconds
                 Supported: $supportedHeader
+                User-Agent: $outgoingUserAgent
                 Accept: application/sdp
                 Min-SE: $minSeSeconds
                 Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"

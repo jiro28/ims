@@ -12,6 +12,8 @@ import android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_LTE
  * an XML/resource loader before the policy surface has stabilized.
  */
 
+private const val TELE2_KZ_S24U_USER_AGENT = "SM-S928B-YY Samsung IMS 7.0"
+
 private const val TELE2_KZ_FULL_EUTRAN_PANI =
     "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=20810b8c49752501"
 
@@ -87,6 +89,7 @@ data class SipCarrierPolicy(
         OutgoingCodecOfferPolicy.DEFAULT,
     val omitOutgoingInvitePrecondition: Boolean = false,
     val explicitOutgoingRtcpAttribute: Boolean = false,
+    val outgoingUserAgentOverride: String? = null,
     val outgoingPreferredIdentityPolicy: OutgoingPreferredIdentityPolicy =
         OutgoingPreferredIdentityPolicy.DEFAULT,
     val outgoingFromIdentityPolicy: OutgoingFromIdentityPolicy =
@@ -400,6 +403,10 @@ data class SipCarrierPolicy(
                     // Stock-ish media test after URI/identity variants still hit OCS.
                     // Keep local TEL routing, restore normal SDP, and advertise RTCP.
                     explicitOutgoingRtcpAttribute = true,
+                    // Test whether Tele2 KZ buckets outgoing VoLTE by
+                    // the Samsung IMS profile/model in User-Agent.
+                    outgoingUserAgentOverride =
+                        TELE2_KZ_S24U_USER_AGENT,
                     // Test originating identity using the 3GPP associated URI.
                     // Expected From/PPI: sip:+own@ims.mnc077.mcc401.3gppnetwork.org;user=phone
                     outgoingUse3gppRealmIdentityForInvite = false,
@@ -532,6 +539,9 @@ data class SipCarrierSettings(
 
     fun useExplicitOutgoingRtcpAttributePolicy(): Boolean =
         policy.useExplicitOutgoingRtcpAttributePolicy()
+
+    fun outgoingUserAgentOverridePolicy(): String? =
+        policy.outgoingUserAgentOverride
 
     fun useTelFromIdentityOutgoingPolicy(): Boolean =
         policy.useTelFromIdentityOutgoingPolicy()
