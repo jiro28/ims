@@ -183,6 +183,7 @@ internal enum class IncomingAcceptMediaPrewarmAction {
 }
 
 internal object SipIncomingInviteFinalResponses {
+    private const val TAG = "PHH SipIncoming"
 
 
 
@@ -351,12 +352,13 @@ internal object SipIncomingInviteFinalResponses {
         } else {
             "Content-Length: 0".toSipHeadersMap()
         }
+        val sessionTimerHeaders =
+            SipSessionTimerNegotiation.responseHeadersForIncomingRequest(callHeaders, TAG)
         val responseHeaders =
-            callHeaders - "rseq" - "security-verify" - "p-access-network-info" - "content-type" - "content-length" +
-                """
-                Session-Expires: 1800;refresher=uas
-                Contact: $contact
-                """.toSipHeadersMap() +
+            callHeaders - "rseq" - "security-verify" - "p-access-network-info" - "content-type" - "content-length" -
+                "session-expires" - "min-se" - "require" +
+                "Contact: $contact".toSipHeadersMap() +
+                sessionTimerHeaders +
                 finalSdpHeaders
 
         return SipResponse(
@@ -382,17 +384,20 @@ internal object SipIncomingInviteFinalResponses {
         } else {
             "Content-Length: 0".toSipHeadersMap()
         }
+        val sessionTimerHeaders =
+            SipSessionTimerNegotiation.responseHeadersForIncomingRequest(callHeaders, TAG)
         val finalHeaders =
             callHeaders -
                 "rseq" -
                 "security-verify" -
                 "p-access-network-info" -
                 "content-type" -
-                "content-length" +
-                (
-                    "Session-Expires: 1800;refresher=uas\n" +
-                        "Contact: $contact\n"
-                ).toSipHeadersMap() +
+                "content-length" -
+                "session-expires" -
+                "min-se" -
+                "require" +
+                "Contact: $contact".toSipHeadersMap() +
+                sessionTimerHeaders +
                 finalSdpHeaders
 
         return SipResponse(

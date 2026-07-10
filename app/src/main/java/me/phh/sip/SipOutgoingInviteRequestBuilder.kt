@@ -162,7 +162,7 @@ internal object SipOutgoingInviteRequestBuilder {
                 Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS
                 P-Early-Media: supported
                 Content-Type: application/sdp
-                Session-Expires: $sessionExpiresSeconds
+                Session-Expires: ${SipSessionTimerNegotiation.outgoingRequestValue(sessionExpiresSeconds)}
                 Supported: 100rel, replaces, timer, precondition
                 Accept: application/sdp
                 Min-SE: $minSeSeconds

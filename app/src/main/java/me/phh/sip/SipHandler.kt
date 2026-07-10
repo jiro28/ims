@@ -4459,11 +4459,10 @@ fun onWfcDisabled(reason: String) {
 
     Call is now running.
 
-    Session timers (RFC 4028): we advertise Session-Expires: 900 / Supported: timer.
-    The network nominates a refresher; if it nominates us (UAC), we must send a re-INVITE
-    before the session expires. If it nominates itself (UAS), it sends re-INVITEs to us and
-    we respond 200 OK (handled in parseMessage as an incoming INVITE).
-    NOTE: periodic re-INVITE sending is not yet implemented for the UAC-refresher case.
+    Session timers (RFC 4028): we advertise 1800 seconds and prefer the peer as
+    refresher. Incoming requests without a refresher preference are also assigned to the
+    peer. Explicit requests that select PhhIms as refresher are accepted and logged, but
+    periodic local refresh sending is not yet implemented.
      */
 
     var respInFlight: SipResponse? = null

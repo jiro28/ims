@@ -343,21 +343,15 @@ internal object SipInDialogInvite {
         request: SipRequest,
         logTag: String,
     ): Map<String, List<String>> {
-        val requestSessionExpires = request.headers["session-expires"]?.getOrNull(0)
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-        val requestMinSe = request.headers["min-se"]?.getOrNull(0)
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-        val inDialogSessionTimerHeaders = mutableMapOf<String, List<String>>()
-        requestSessionExpires?.let { inDialogSessionTimerHeaders["session-expires"] = listOf(it) }
-        requestMinSe?.let { inDialogSessionTimerHeaders["min-se"] = listOf(it) }
+        val responseHeaders = SipSessionTimerNegotiation.responseHeadersForIncomingRequest(
+            requestHeaders = request.headers,
+            logTag = logTag,
+        )
         Rlog.d(
             logTag,
-            "In-dialog INVITE session timer response headers: " +
-                "Session-Expires=$requestSessionExpires Min-SE=$requestMinSe",
+            "In-dialog INVITE session timer response headers: $responseHeaders",
         )
-        return inDialogSessionTimerHeaders
+        return responseHeaders
     }
 
 

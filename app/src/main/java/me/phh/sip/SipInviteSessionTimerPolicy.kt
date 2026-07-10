@@ -71,7 +71,7 @@ class SipInviteSessionTimerPolicy(
                 """
                 CSeq: $retryCseqNumber INVITE
                 Min-SE: $minSe
-                Session-Expires: $sessionExpires
+                Session-Expires: ${SipSessionTimerNegotiation.outgoingRequestValue(sessionExpires)}
                 """.toSipHeadersMap()
         )
 
