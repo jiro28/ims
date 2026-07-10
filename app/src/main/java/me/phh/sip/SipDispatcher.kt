@@ -126,11 +126,12 @@ internal class SipDispatcher(
         )
 
         Rlog.d(tag, "Replying back with $reply")
-        synchronized(writer) {
-            writer.write(reply.toByteArray())
-            writer.flush()
-        }
-        return true
+        return SipMessageWriter.write(
+            tag = tag,
+            writer = writer,
+            bytes = reply.toByteArray(),
+            label = "dispatcher ${msg.method} response ${reply.statusCode}",
+        )
     }
 
     fun handleResponse(response: SipResponse): Boolean {

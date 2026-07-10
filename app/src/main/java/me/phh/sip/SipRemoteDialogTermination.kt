@@ -218,6 +218,10 @@ internal object SipRemoteDialogTermination {
         responseWriter: OutputStream,
         response: SipResponse,
     ) {
-        synchronized(responseWriter) { responseWriter.write(response.toByteArray()) }
+        SipMessageWriter.write(
+            responseWriter,
+            response.toByteArray(),
+            "remote dialog termination response ${response.statusCode}",
+        )
     }
 }

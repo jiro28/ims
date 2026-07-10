@@ -365,7 +365,11 @@ internal object SipInDialogInvite {
         responseWriter: OutputStream,
         response: SipResponse,
     ) {
-        synchronized(responseWriter) { responseWriter.write(response.toByteArray()) }
+        SipMessageWriter.write(
+            responseWriter,
+            response.toByteArray(),
+            "in-dialog INVITE 200 response",
+        )
     }
 
     fun okResponseWithSdp(

@@ -88,9 +88,11 @@ internal object SipUpdateResponseWriter {
         logTag: String,
     ) {
         Rlog.d(logTag, "Replying to UPDATE with $reply")
-        synchronized(updateResponseWriter) {
-            updateResponseWriter.write(reply.toByteArray())
-        }
+        SipMessageWriter.write(
+            updateResponseWriter,
+            reply.toByteArray(),
+            "UPDATE response ${reply.statusCode}",
+        )
     }
 
 
@@ -136,8 +138,10 @@ internal object SipUpdateResponseWriter {
             headersParam = myHeaders2,
         )
         Rlog.d(logTag, "Sending $msg2")
-        synchronized(updateResponseWriter) {
-            updateResponseWriter.write(msg2.toByteArray())
-        }
+        SipMessageWriter.write(
+            updateResponseWriter,
+            msg2.toByteArray(),
+            "incoming ringing after UPDATE",
+        )
     }
 }

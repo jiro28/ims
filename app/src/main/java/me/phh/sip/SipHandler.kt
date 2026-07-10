@@ -202,13 +202,20 @@ class SipHandler(
         writer: java.io.OutputStream,
         label: String,
         bytes: ByteArray,
-    ) {
-        val firstLine = bytes.toString(Charsets.US_ASCII).lineSequence().firstOrNull().orEmpty()
-        synchronized(writer) {
-            writer.write(bytes)
-            writer.flush()
+    ): Boolean {
+        val written = SipMessageWriter.write(TAG, writer, bytes, label)
+        if (written) {
+            val firstLine = bytes
+                .toString(Charsets.US_ASCII)
+                .lineSequence()
+                .firstOrNull()
+                .orEmpty()
+            Rlog.d(
+                TAG,
+                "SIP write complete label=$label bytes=${bytes.size} firstLine=$firstLine",
+            )
         }
-        Rlog.d(TAG, "SIP write complete label=$label bytes=${bytes.size} firstLine=$firstLine")
+        return written
     }
 
 
@@ -1328,16 +1335,18 @@ fun onWfcDisabled(reason: String) {
         requestName: String,
         callId: String?,
         reason: String,
-        t: Throwable,
+        error: Throwable? = null,
     ) {
         val callIdText = callId ?: "<none>"
         val reconnectReason =
             "SIP transport lost while sending local $requestName callId=$callIdText: $reason"
-        Rlog.w(
-            TAG,
-            "$reconnectReason; clearing local call state and scheduling IMS reconnect",
-            t,
-        )
+        val logMessage =
+            "$reconnectReason; clearing local call state and scheduling IMS reconnect"
+        if (error != null) {
+            Rlog.w(TAG, logMessage, error)
+        } else {
+            Rlog.w(TAG, logMessage)
+        }
 
         if (callId != null && currentCall?.callIdOrNull() == callId) {
             currentCall = null
@@ -2695,9 +2704,9 @@ fun onWfcDisabled(reason: String) {
         )
         val registerBytesWithNetworkHeaders = addCarrierRegisterNetworkHeaders(msg.toByteArray())
         Rlog.d(TAG, "Sending ${registerBytesWithNetworkHeaders.toString(Charsets.US_ASCII)}")
-        synchronized(writer) {
-            writer.write(registerBytesWithNetworkHeaders)
-            writer.flush()
+        if (!writeSipBytesWithFlush(writer, "REGISTER", registerBytesWithNetworkHeaders)) {
+            reconnectIms("REGISTER write failed")
+            return
         }
         registerCounter += 1
     }
@@ -3370,11 +3379,19 @@ fun onWfcDisabled(reason: String) {
                 dualSimDebugContext = imsDualSimDebugContext(),
             ),
         )
-        writeSipBytesWithFlush(
-            socket.gWriter(),
-            SipOutgoingInviteRetryPolicy.illegalSdpRetryWriteLabel(),
-            retryInvite.toByteArray(),
-        )
+        if (!writeSipBytesWithFlush(
+                socket.gWriter(),
+                SipOutgoingInviteRetryPolicy.illegalSdpRetryWriteLabel(),
+                retryInvite.toByteArray(),
+            )
+        ) {
+            failOutgoingCallSetup(
+                statusString = "IMS signaling transport unavailable",
+                logReason = "illegal-SDP INVITE retry write failed",
+                rtpSocket = pending.rtpSocket,
+                reconnectReason = "illegal-SDP INVITE retry write failed",
+            )
+        }
         return true
     }
 
@@ -3423,10 +3440,18 @@ fun onWfcDisabled(reason: String) {
                 cseqNumber = retry.cseqNumber,
             ),
         )
-        val writer = socket.gWriter()
-        synchronized(writer) {
-            writer.write(retryInvite.toByteArray())
-            writer.flush()
+        if (!writeSipBytesWithFlush(
+                socket.gWriter(),
+                "session-timer INVITE retry callId=${pending.callId}",
+                retryInvite.toByteArray(),
+            )
+        ) {
+            failOutgoingCallSetup(
+                statusString = "IMS signaling transport unavailable",
+                logReason = "session-timer INVITE retry write failed",
+                rtpSocket = pending.rtpSocket,
+                reconnectReason = "session-timer INVITE retry write failed",
+            )
         }
         return true
     }
@@ -4078,7 +4103,19 @@ fun onWfcDisabled(reason: String) {
                     """.toSipHeadersMap()
             )
         Rlog.d(TAG, "Sending $msg")
-        writeSipBytesWithFlush(socket.gWriter(), "SipHandler msg", msg.toByteArray())
+        if (!writeSipBytesWithFlush(
+                socket.gWriter(),
+                "outgoing PRACK callId=$callId",
+                msg.toByteArray(),
+            )
+        ) {
+            failOutgoingCallSetup(
+                statusString = "IMS signaling transport unavailable",
+                logReason = "outgoing PRACK write failed",
+                rtpSocket = pendingOutgoingInvite?.rtpSocket,
+                reconnectReason = "outgoing PRACK write failed",
+            )
+        }
     }
 
     fun rejectCall(callId: String? = null) {
@@ -4181,18 +4218,16 @@ fun onWfcDisabled(reason: String) {
             cancelHeaders = cancelHeaders,
         )
         Rlog.d(TAG, SipRemoteDialogTermination.pendingCancelSendLog(pending.callId, reason, cancel))
-        try {
-            writeSipBytesWithFlush(
+        if (!writeSipBytesWithFlush(
                 socket.gWriter(),
                 SipRemoteDialogTermination.pendingCancelWriteLabel(),
                 cancel.toByteArray(),
             )
-        } catch (t: IOException) {
+        ) {
             recoverAfterLocalTerminateWriteFailure(
                 requestName = "CANCEL",
                 callId = pending.callId,
                 reason = reason,
-                t = t,
             )
             return false
         }
@@ -4220,18 +4255,16 @@ fun onWfcDisabled(reason: String) {
             byeHeaders = byeHeaders,
         )
         Rlog.d(TAG, SipRemoteDialogTermination.byeLog(bye))
-        try {
-            writeSipBytesWithFlush(
+        if (!writeSipBytesWithFlush(
                 socket.gWriter(),
                 SipRemoteDialogTermination.byeWriteLabel(),
                 bye.toByteArray(),
             )
-        } catch (t: IOException) {
+        ) {
             recoverAfterLocalTerminateWriteFailure(
                 requestName = "BYE",
                 callId = callId,
                 reason = "local call termination",
-                t = t,
             )
         }
     }
@@ -4456,6 +4489,7 @@ fun onWfcDisabled(reason: String) {
         rtpSocket: DatagramSocket? = null,
         reconnectReason: String? = null,
         localImsAddressStale: Boolean = false,
+        csRetry: Boolean = true,
     ) {
         if (!outgoingCallSetupFailureReported.compareAndSet(false, true)) {
             closeOutgoingSetupRtpSocket(rtpSocket, "duplicate failure: $logReason")
@@ -4492,8 +4526,8 @@ fun onWfcDisabled(reason: String) {
             "statusCode" to "480",
             "statusString" to statusString,
             "callStartFailed" to "true",
-            "csRetry" to "true",
         )
+        if (csRetry) extras["csRetry"] = "true"
         pendingCallId?.let { extras["call-id"] = it }
         if (localImsAddressStale) {
             extras["localImsAddressStale"] = "true"
@@ -4774,7 +4808,21 @@ fun onWfcDisabled(reason: String) {
         val msg2 = outgoingFinalInviteAckRequest.request
         val cseq = outgoingFinalInviteAckRequest.inviteCseq
         Rlog.d(TAG, SipOutgoingInviteFinalAckState.sendingFinalInviteAckLog(msg2))
-        synchronized(socket.gWriter()) { socket.gWriter().write(msg2.toByteArray()); socket.gWriter().flush() }
+        if (!writeSipBytesWithFlush(
+                socket.gWriter(),
+                "final outgoing INVITE ACK callId=$finalInviteCallId",
+                msg2.toByteArray(),
+            )
+        ) {
+            failOutgoingCallSetup(
+                statusString = "IMS final ACK failed",
+                logReason = "final outgoing INVITE ACK write failed",
+                rtpSocket = currentCall?.rtpSocket ?: pendingOutgoingInvite?.rtpSocket,
+                reconnectReason = "final outgoing INVITE ACK write failed",
+                csRetry = false,
+            )
+            return true
+        }
         callStarted.set(true)
         updateOutgoingDialogAfterFinalInviteAck(
             response = response,
@@ -5229,11 +5277,19 @@ fun onWfcDisabled(reason: String) {
                 newSdp = newSdp,
             )
             Rlog.d(TAG, SipOutgoingDialogSdp.sendingPreconditionUpdateLog(msg2))
-            writeSipBytesWithFlush(
-                socket.gWriter(),
-                SipOutgoingDialogSdp.preconditionUpdateWriteLabel(),
-                msg2.toByteArray(),
-            )
+            if (!writeSipBytesWithFlush(
+                    socket.gWriter(),
+                    SipOutgoingDialogSdp.preconditionUpdateWriteLabel(),
+                    msg2.toByteArray(),
+                )
+            ) {
+                failOutgoingCallSetup(
+                    statusString = "IMS signaling transport unavailable",
+                    logReason = "outgoing precondition UPDATE write failed",
+                    rtpSocket = currentCall?.rtpSocket ?: pendingOutgoingInvite?.rtpSocket,
+                    reconnectReason = "outgoing precondition UPDATE write failed",
+                )
+            }
         }
 
         return false
@@ -5447,7 +5503,9 @@ fun onWfcDisabled(reason: String) {
                 body = body,
                 debugContext = { context -> imsDualSimDebugContext(context) },
                 writeBytes = { bytes ->
-                    writeSipBytesWithFlush(socket.gWriter(), "SipHandler msg", bytes)
+                    if (!writeSipBytesWithFlush(socket.gWriter(), "initial outgoing INVITE", bytes)) {
+                        throw IOException("initial outgoing INVITE write failed")
+                    }
                 },
             )
             true
@@ -6512,7 +6570,7 @@ fun onWfcDisabled(reason: String) {
         inviteCseqNumber: Int,
         requestHeaders: SipHeadersMap,
         label: String,
-    ) {
+    ): Boolean {
         val ackDestination = response.headers["contact"]?.getOrNull(0)
             ?.let { extractDestinationFromContact(it) }
             ?: call.remoteContact
@@ -6529,7 +6587,7 @@ fun onWfcDisabled(reason: String) {
             ackHeaders,
         )
         Rlog.d(TAG, "Sending ACK for $label: $ack")
-        writeSipBytesWithFlush(socket.gWriter(), "$label ACK", ack.toByteArray())
+        return writeSipBytesWithFlush(socket.gWriter(), "$label ACK", ack.toByteArray())
     }
 
 
@@ -6566,13 +6624,18 @@ fun onWfcDisabled(reason: String) {
                 }
                 in 200..299 -> {
                     Rlog.w(TAG, "Call-waiting hold re-INVITE accepted: callId=$callId status=${response.statusCode} cseq=$cseq")
-                    sendAckForLocalReinvite2xx(
-                        call = call,
-                        response = response,
-                        inviteCseqNumber = inviteCseq,
-                        requestHeaders = headers,
-                        label = "call-waiting hold re-INVITE",
-                    )
+                    if (!sendAckForLocalReinvite2xx(
+                            call = call,
+                            response = response,
+                            inviteCseqNumber = inviteCseq,
+                            requestHeaders = headers,
+                            label = "call-waiting hold re-INVITE",
+                        )
+                    ) {
+                        reconnectIms("call-waiting hold ACK write failed")
+                        onComplete(false)
+                        return@setResponseCallback true
+                    }
                     pauseCurrentCallMediaForLocalHold(
                         call = call,
                         reason = "local hold re-INVITE accepted",
@@ -6595,11 +6658,16 @@ fun onWfcDisabled(reason: String) {
                 "localRtp=${call.rtpSocket.localAddress}:${call.rtpSocket.localPort} " +
                 "remote=${call.remoteContact}",
         )
-        writeSipBytesWithFlush(
-            socket.gWriter(),
-            "call-waiting hold re-INVITE callId=$callId",
-            holdInvite.toByteArray(),
-        )
+        if (!writeSipBytesWithFlush(
+                socket.gWriter(),
+                "call-waiting hold re-INVITE callId=$callId",
+                holdInvite.toByteArray(),
+            )
+        ) {
+            removeResponseCallback(callId)
+            reconnectIms("call-waiting hold re-INVITE write failed")
+            return false
+        }
         return true
     }
 
@@ -6790,13 +6858,18 @@ fun onWfcDisabled(reason: String) {
                         "Current foreground resume re-INVITE accepted: " +
                             "callId=$callId status=${response.statusCode} cseq=$cseq",
                     )
-                    sendAckForLocalReinvite2xx(
-                        call = call,
-                        response = response,
-                        inviteCseqNumber = inviteCseq,
-                        requestHeaders = headers,
-                        label = "current foreground resume re-INVITE",
-                    )
+                    if (!sendAckForLocalReinvite2xx(
+                            call = call,
+                            response = response,
+                            inviteCseqNumber = inviteCseq,
+                            requestHeaders = headers,
+                            label = "current foreground resume re-INVITE",
+                        )
+                    ) {
+                        reconnectIms("current foreground resume ACK write failed")
+                        onComplete(false)
+                        return@setResponseCallback true
+                    }
                     val resumedCall = callWithRtpFromLocalReinviteAnswer(
                         call = call,
                         response = response,
@@ -6828,11 +6901,16 @@ fun onWfcDisabled(reason: String) {
                 "localRtp=${call.rtpSocket.localAddress}:${call.rtpSocket.localPort} " +
                 "remote=${call.remoteContact}",
         )
-        writeSipBytesWithFlush(
-            socket.gWriter(),
-            "current foreground resume re-INVITE callId=$callId",
-            resumeInvite.toByteArray(),
-        )
+        if (!writeSipBytesWithFlush(
+                socket.gWriter(),
+                "current foreground resume re-INVITE callId=$callId",
+                resumeInvite.toByteArray(),
+            )
+        ) {
+            removeResponseCallback(callId)
+            reconnectIms("current foreground resume re-INVITE write failed")
+            return false
+        }
         return true
     }
 
@@ -6874,13 +6952,18 @@ fun onWfcDisabled(reason: String) {
                 }
                 in 200..299 -> {
                     Rlog.w(TAG, "Call-waiting resume re-INVITE accepted: callId=$callId status=${response.statusCode} cseq=$cseq")
-                    sendAckForLocalReinvite2xx(
-                        call = call,
-                        response = response,
-                        inviteCseqNumber = inviteCseq,
-                        requestHeaders = headers,
-                        label = "call-waiting resume re-INVITE",
-                    )
+                    if (!sendAckForLocalReinvite2xx(
+                            call = call,
+                            response = response,
+                            inviteCseqNumber = inviteCseq,
+                            requestHeaders = headers,
+                            label = "call-waiting resume re-INVITE",
+                        )
+                    ) {
+                        reconnectIms("call-waiting resume ACK write failed")
+                        onComplete(false)
+                        return@setResponseCallback true
+                    }
                     val held = clearHeldForegroundCall(
                         callId = callId,
                         closeRtpSocket = false,
@@ -6913,11 +6996,16 @@ fun onWfcDisabled(reason: String) {
                 "localRtp=${call.rtpSocket.localAddress}:${call.rtpSocket.localPort} " +
                 "remote=${call.remoteContact}",
         )
-        writeSipBytesWithFlush(
-            socket.gWriter(),
-            "call-waiting resume re-INVITE callId=$callId",
-            resumeInvite.toByteArray(),
-        )
+        if (!writeSipBytesWithFlush(
+                socket.gWriter(),
+                "call-waiting resume re-INVITE callId=$callId",
+                resumeInvite.toByteArray(),
+            )
+        ) {
+            removeResponseCallback(callId)
+            reconnectIms("call-waiting resume re-INVITE write failed")
+            return false
+        }
         return true
     }
 
@@ -7257,7 +7345,11 @@ fun onWfcDisabled(reason: String) {
     ) {
         val trying = SipIncomingInviteDialogSetup.explicitTryingResponse(request)
         Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.explicitTryingLog(trying))
-        synchronized(incomingResponseWriter) { incomingResponseWriter.write(trying.toByteArray()) }
+        writeSipBytesWithFlush(
+            incomingResponseWriter,
+            "incoming INVITE 100 Trying callId=${request.callIdOrEmpty()}",
+            trying.toByteArray(),
+        )
     }
 
 
@@ -7405,14 +7497,27 @@ fun onWfcDisabled(reason: String) {
                 sdp = sdp,
             )
             Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.reliableIncoming183Log(msg))
-            writeSipBytesWithFlush(incomingResponseWriter, "SipHandler msg", msg.toByteArray())
+            if (!writeSipBytesWithFlush(
+                    incomingResponseWriter,
+                    "incoming INVITE reliable 183 rseq=$reliableSequence",
+                    msg.toByteArray(),
+                )
+            ) {
+                prAckWaitTracker.clearAndNotifyAll()
+                reconnectIms("incoming reliable 183 write failed")
+                return
+            }
             waitPrack(reliableSequence)
         } else if (plainRingingAlreadySent) {
             Rlog.d(TAG, "Skipping delayed 180 Ringing; fast 180 already sent")
         } else {
             val msg2 = SipIncomingInviteDialogSetup.plainRingingResponse(headers)
             Rlog.d(TAG, SipIncomingInviteRequestFlowLogs.plainIncoming180Log(msg2))
-            synchronized(incomingResponseWriter) { incomingResponseWriter.write(msg2.toByteArray()) }
+            writeSipBytesWithFlush(
+                incomingResponseWriter,
+                "incoming INVITE 180 Ringing",
+                msg2.toByteArray(),
+            )
         }
     }
 
@@ -7506,12 +7611,11 @@ fun onWfcDisabled(reason: String) {
             "Sending fast 180 Ringing before async incoming setup: " +
                 "callId=$incomingCallId sendReliable183=${incomingOffer.sendReliable183}",
         )
-        writeSipBytesWithFlush(
+        return writeSipBytesWithFlush(
             incomingResponseWriter,
             "fast incoming 180 Ringing callId=$incomingCallId",
             ringing.toByteArray(),
         )
-        return true
     }
 
 
@@ -7677,6 +7781,10 @@ fun onWfcDisabled(reason: String) {
             localToTag = incomingLocalToTag,
             reliableSequence = incomingReliableSequence,
         )
+        if (!fastPlainRingingSent) {
+            reconnectIms("fast incoming 180 Ringing write failed")
+            return 0
+        }
 
         startIncomingInviteDialogSetup(
             request = request,

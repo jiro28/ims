@@ -221,12 +221,23 @@ internal class SipSmsHandler(
         label: String,
         bytes: ByteArray,
     ) {
-        val firstLine = bytes.toString(Charsets.US_ASCII).lineSequence().firstOrNull().orEmpty()
-        synchronized(writer) {
-            writer.write(bytes)
-            writer.flush()
+        if (SipMessageWriter.write(
+                tag = tag,
+                writer = writer,
+                bytes = bytes,
+                label = label,
+            )
+        ) {
+            val firstLine = bytes
+                .toString(Charsets.US_ASCII)
+                .lineSequence()
+                .firstOrNull()
+                .orEmpty()
+            Rlog.d(
+                tag,
+                "SIP SMS write complete label=$label bytes=${bytes.size} firstLine=$firstLine",
+            )
         }
-        Rlog.d(tag, "SIP SMS write complete label=$label bytes=${bytes.size} firstLine=$firstLine")
     }
 
     fun sendSms(
