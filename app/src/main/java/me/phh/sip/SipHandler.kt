@@ -4199,17 +4199,27 @@ fun onWfcDisabled(reason: String) {
     }
 
     private fun sendByeForCall(call: Call) {
+        val callId = call.callIdOrNull()
         val byeHeaders = localDialogHeadersForRequest(call, SipMethod.BYE)
         val bye = SipRemoteDialogTermination.byeRequest(
             remoteContact = call.remoteContact,
             byeHeaders = byeHeaders,
         )
         Rlog.d(TAG, SipRemoteDialogTermination.byeLog(bye))
-        writeSipBytesWithFlush(
-            socket.gWriter(),
-            SipRemoteDialogTermination.byeWriteLabel(),
-            bye.toByteArray(),
-        )
+        try {
+            writeSipBytesWithFlush(
+                socket.gWriter(),
+                SipRemoteDialogTermination.byeWriteLabel(),
+                bye.toByteArray(),
+            )
+        } catch (t: IOException) {
+            recoverAfterLocalTerminateWriteFailure(
+                requestName = "BYE",
+                callId = callId,
+                reason = "local call termination",
+                t = t,
+            )
+        }
     }
 
     fun terminateCall(callId: String? = null) {
