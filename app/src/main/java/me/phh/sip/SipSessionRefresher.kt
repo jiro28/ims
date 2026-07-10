@@ -37,10 +37,16 @@ internal class SipSessionRefresher(
         private const val MAX_ATTEMPTS = 2
     }
 
+    private enum class Mode {
+        LOCAL_REFRESH,
+        PEER_EXPIRY,
+    }
+
     private data class State(
         val intervalSeconds: Int,
         val generation: Int,
         val attempt: Int,
+        val mode: Mode,
         val cseqNumber: Int? = null,
     )
 
@@ -80,15 +86,18 @@ internal class SipSessionRefresher(
         selection: SipSessionTimerSelection,
         localRefresher: String,
     ) {
-        if (!selection.refresher.equals(localRefresher, ignoreCase = true)) {
-            cancel(callId, "peer is refresher=${selection.refresher}")
-            return
-        }
+        val localRefresh =
+            selection.refresher.equals(localRefresher, ignoreCase = true)
         schedule(
             callId = callId,
             intervalSeconds = selection.intervalSeconds,
             attempt = 0,
-            delayMs = refreshDelayMs(selection.intervalSeconds),
+            mode = if (localRefresh) Mode.LOCAL_REFRESH else Mode.PEER_EXPIRY,
+            delayMs = if (localRefresh) {
+                refreshDelayMs(selection.intervalSeconds)
+            } else {
+                peerExpiryDelayMs(selection.intervalSeconds)
+            },
         )
     }
 
@@ -120,6 +129,7 @@ internal class SipSessionRefresher(
         callId: String,
         intervalSeconds: Int,
         attempt: Int,
+        mode: Mode,
         delayMs: Long,
     ) {
         val old: State?
@@ -130,6 +140,7 @@ internal class SipSessionRefresher(
                 intervalSeconds = intervalSeconds.coerceAtLeast(MIN_INTERVAL_SECONDS),
                 generation = nextGeneration++,
                 attempt = attempt,
+                mode = mode,
             )
             states[callId] = state
         }
@@ -138,7 +149,7 @@ internal class SipSessionRefresher(
         }
         Rlog.d(
             tag,
-            "Scheduled session refresh: callId=$callId " +
+            "Scheduled session timer: callId=$callId mode=${state.mode} " +
                 "interval=${state.intervalSeconds}s delayMs=$delayMs attempt=$attempt",
         )
         handler.postDelayed(
@@ -149,6 +160,13 @@ internal class SipSessionRefresher(
 
     private fun sendIfCurrent(callId: String, generation: Int) {
         val state = currentState(callId, generation) ?: return
+        if (state.mode == Mode.PEER_EXPIRY) {
+            terminateAfterRefreshFailure(
+                callId = callId,
+                reason = "peer did not refresh before expiration",
+            )
+            return
+        }
         val dialog = dialogProvider(callId) ?: run {
             cancel(callId, "dialog no longer exists")
             return
@@ -256,6 +274,7 @@ internal class SipSessionRefresher(
                 callId = callId,
                 intervalSeconds = intervalSeconds,
                 attempt = state.attempt + 1,
+                mode = Mode.LOCAL_REFRESH,
                 delayMs = RETRY_DELAY_MS,
             )
             return
@@ -302,4 +321,11 @@ internal class SipSessionRefresher(
 
     private fun refreshDelayMs(intervalSeconds: Int): Long =
         intervalSeconds.coerceAtLeast(MIN_INTERVAL_SECONDS).toLong() * 500L
+
+    private fun peerExpiryDelayMs(intervalSeconds: Int): Long {
+        val intervalMs =
+            intervalSeconds.coerceAtLeast(MIN_INTERVAL_SECONDS).toLong() * 1_000L
+        val earlyTerminationMs = minOf(32_000L, intervalMs / 3L)
+        return intervalMs - earlyTerminationMs
+    }
 }
