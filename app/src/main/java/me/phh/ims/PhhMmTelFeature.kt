@@ -586,10 +586,10 @@ class PhhMmTelFeature(
                 mState = State.TERMINATED
 
                 if (this::mListener.isInitialized) {
-                    mListener.callSessionTerminated(
+                    mListener.callSessionInitiatingFailed(
                         ImsReasonInfo(
-                            ImsReasonInfo.CODE_NETWORK_REJECT,
-                            0,
+                            ImsReasonInfo.CODE_LOCAL_CALL_CS_RETRY_REQUIRED,
+                            ImsReasonInfo.EXTRA_CODE_CALL_RETRY_SILENT_REDIAL,
                             "IMS reconnecting",
                         )
                     )
@@ -906,8 +906,15 @@ class PhhMmTelFeature(
         val statusMessage = (map["statusString"] as? String) ?: "Kikoo"
         val localReject = map["localReject"] == "true"
         val remoteNoMediaRelease = map["remoteNoMediaRelease"] == "true"
+        val csRetry = map["csRetry"] == "true"
 
         return when {
+            csRetry -> ImsReasonInfo(
+                ImsReasonInfo.CODE_LOCAL_CALL_CS_RETRY_REQUIRED,
+                ImsReasonInfo.EXTRA_CODE_CALL_RETRY_SILENT_REDIAL,
+                statusMessage,
+            )
+
             localReject -> ImsReasonInfo(ImsReasonInfo.CODE_USER_DECLINE, 0, statusMessage)
 
             remoteNoMediaRelease -> {
@@ -1224,10 +1231,24 @@ sipHandler.imsFailureCallback = {
             Rlog.d(TAG, "Cancelling call")
             val reasonInfo = cancelledReasonInfo(map)
             val cancelledCallId = map["call-id"]?.takeIf { it.isNotBlank() }
+            val callStartFailed = map["callStartFailed"] == "true"
+            val matchesOutgoingCall =
+                outgoingCallActive &&
+                    (cancelledCallId == null ||
+                        cancelledCallId == outgoingCallSipCallId ||
+                        (callStartFailed && outgoingCallSipCallId == null))
 
-            if (cancelledCallId != null && cancelledCallId == outgoingCallSipCallId) {
-                Rlog.d(TAG, "Routing outgoing call cancellation to callId=$cancelledCallId")
-                outgoingCallListener?.callSessionTerminated(reasonInfo)
+            if (matchesOutgoingCall) {
+                Rlog.d(
+                    TAG,
+                    "Routing outgoing call cancellation to callId=$cancelledCallId " +
+                        "callStartFailed=$callStartFailed",
+                )
+                if (callStartFailed) {
+                    outgoingCallListener?.callSessionInitiatingFailed(reasonInfo)
+                } else {
+                    outgoingCallListener?.callSessionTerminated(reasonInfo)
+                }
                 outgoingCallActive = false
                 outgoingCallSipCallId = null
                 outgoingCallListener = null
@@ -1244,18 +1265,6 @@ sipHandler.imsFailureCallback = {
                         "No IMS call listener for cancellation callId=$cancelledCallId; " +
                             "not falling back to another call. reason=$reason map=$map",
                     )
-                } else if (outgoingCallActive) {
-                    Rlog.w(
-                        TAG,
-                        "Routing cancellation without Call-ID to foreground outgoing call: " +
-                            "reason=$reason map=$map",
-                    )
-                    outgoingCallListener?.callSessionTerminated(reasonInfo)
-                    outgoingCallActive = false
-                    outgoingCallSipCallId = null
-                    outgoingCallListener = null
-                    outgoingCallAutoResumeReporter = null
-                    outgoingCallRemoteHoldReporter = null
                 } else {
                     val fallbackIncomingListener = takeIncomingCallListener(null)
                     if (fallbackIncomingListener != null) {

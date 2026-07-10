@@ -877,6 +877,21 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         )
     }
 
+    private fun outgoingCallSetupFailureForImsNetworkLoss(): Map<String, String>? {
+        val callId = pendingOutgoingInvite?.callId
+            ?: currentCall
+                ?.takeIf { it.outgoing && !callStarted.get() }
+                ?.callIdOrNull()
+            ?: return null
+
+        return mapOf(
+            "call-id" to callId,
+            "callStartFailed" to "true",
+            "csRetry" to "true",
+            "statusString" to "IMS bearer lost during outgoing call setup",
+        )
+    }
+
     private fun clearCallAndCallbackStateForReconnect() {
         stopCallRuntime("IMS reconnect")
         incomingFinalResponseSent.set(false)
@@ -2309,11 +2324,18 @@ fun onWfcDisabled(reason: String) {
                 Rlog.d(TAG, "Unregistering stale IMS NetworkCallback failed", t)
             }
             Rlog.w(TAG, "Current IMS network was lost; dropping SIP state")
+            val outgoingSetupFailure = outgoingCallSetupFailureForImsNetworkLoss()
             Rlog.w(TAG, "Invalidating IMS reconnect generation: current IMS network lost")
             reconnectController.invalidatePendingReconnects("IMS network state changed")
             dropImsConnection("IMS network lost")
+            outgoingSetupFailure?.let { extras ->
+                Rlog.w(
+                    TAG,
+                    "Failing outgoing IMS call setup for CS retry after network loss: $extras",
+                )
+                onCancelledCall?.invoke(Object(), "IMS network lost", extras)
+            }
             abandonnedBecauseOfNoPcscf = true
-            imsFailureCallback?.invoke()
             scheduleImsNetworkRequestRestart("IMS network lost $lostNetwork", 1_000L)
         }
     }
