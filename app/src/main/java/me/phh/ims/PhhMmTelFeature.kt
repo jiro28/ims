@@ -905,6 +905,7 @@ class PhhMmTelFeature(
         val statusCode = (map["statusCode"] as? String)?.toIntOrNull() ?: -1
         val statusMessage = (map["statusString"] as? String) ?: "Kikoo"
         val localReject = map["localReject"] == "true"
+        val localHangup = map["localHangup"] == "true"
         val remoteNoMediaRelease = map["remoteNoMediaRelease"] == "true"
         val csRetry = map["csRetry"] == "true"
 
@@ -916,6 +917,8 @@ class PhhMmTelFeature(
             )
 
             localReject -> ImsReasonInfo(ImsReasonInfo.CODE_USER_DECLINE, 0, statusMessage)
+
+            localHangup -> ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED, 0, statusMessage)
 
             remoteNoMediaRelease -> {
                 Rlog.w(TAG, "No-media outgoing release; reporting as remote termination for Dialer UX: $statusMessage")
@@ -1232,17 +1235,18 @@ sipHandler.imsFailureCallback = {
             val reasonInfo = cancelledReasonInfo(map)
             val cancelledCallId = map["call-id"]?.takeIf { it.isNotBlank() }
             val callStartFailed = map["callStartFailed"] == "true"
+            val outgoingCall = map["outgoingCall"] == "true"
             val matchesOutgoingCall =
                 outgoingCallActive &&
                     (cancelledCallId == null ||
                         cancelledCallId == outgoingCallSipCallId ||
-                        (callStartFailed && outgoingCallSipCallId == null))
+                        ((callStartFailed || outgoingCall) && outgoingCallSipCallId == null))
 
             if (matchesOutgoingCall) {
                 Rlog.d(
                     TAG,
                     "Routing outgoing call cancellation to callId=$cancelledCallId " +
-                        "callStartFailed=$callStartFailed",
+                        "callStartFailed=$callStartFailed outgoingCall=$outgoingCall",
                 )
                 if (callStartFailed) {
                     outgoingCallListener?.callSessionInitiatingFailed(reasonInfo)

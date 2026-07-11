@@ -88,7 +88,12 @@ internal object SipRemoteDialogTermination {
     fun localHangupBeforeDialogReason(): String = "local hangup before dialog"
 
     fun localCancelExtras(callId: String): Map<String, String> =
-        mapOf("call-id" to callId)
+        mapOf(
+            "call-id" to callId,
+            "statusString" to "Local hangup",
+            "outgoingCall" to "true",
+            "localHangup" to "true",
+        )
 
     fun terminateWithoutCallLog(): String =
         "terminateCall without currentCall or pending outgoing INVITE"
