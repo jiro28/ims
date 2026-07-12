@@ -25,6 +25,8 @@ At a high level it:
 - reports IMS registration state and capabilities back to Android telephony
 - handles VoLTE and VoWiFi voice calls with SIP and RTP
 - negotiates AMR-NB / AMR-WB audio, RTP telephone-event DTMF, SIP session timers, IMS preconditions, UPDATE, and re-INVITE media changes
+- handles call waiting with dialog routing by Call-ID, SIP hold/resume, active/held swaps, and automatic resume after the waiting leg ends
+- optionally applies bundled WebRTC AEC3 echo cancellation to the downlink render reference and uplink microphone PCM before AMR encoding
 - handles SMS over IMS with carrier-specific fallback behaviour where required
 - bridges incoming and outgoing SIP call state into Android `ImsCallSession` callbacks
 - avoids tearing down active calls during LTE/IWLAN tech-only handover events
@@ -40,10 +42,11 @@ a generic certified carrier IMS implementation.
 | IMS registration | Working in current Exynos9810, Exynos9830, and Snapdragon dm1q tests, including AKA/IPsec registration, P-CSCF fallback, temporary P-CSCF failure recovery, REGISTER retry/reconnect handling, 494 fallback handling, transient SIP reconnect handling, invalid-subscription debounce, and stale IMS bearer recovery. |
 | VoLTE outgoing calls | Working in tested configs, including Android call UI progress, SIP setup, PRACK/session-timer handling, RTP, AMR-NB/AMR-WB negotiation, DTMF, BYE handling, carrier-policy-backed retry hooks, short-code handling, emergency-number guardrails, and two-way audio when ROM-side audio fixes are present. |
 | VoLTE incoming calls | Working in current tests for accept, local end, remote end, reject, duplicate INVITE, CANCEL, and precondition call paths. Re-test after every dialog/call-state change. |
+| Call waiting / hold | Working in current tests for a second incoming INVITE, SIP hold/resume, active/held swap, and automatic resume after the waiting leg ends. Conference merge is not implemented and is rejected cleanly. |
 | VoWiFi | Working in current testing on Exynos and Snapdragon targets. IWLAN/LTE route changes still depend heavily on QNS, CarrierConfig, WFC mode, service state, and Samsung RIL behaviour. Cellular/mobile-preferred WFC must still allow calls over IWLAN when the device is currently registered through VoWiFi. |
 | Active VoLTE ↔ VoWiFi switching | Current code defers unsafe tech-only IMS reconnects while a call is active/pending or while media threads are still running. This avoids killing RTP and leaving a fake silent call. Phone-info may still show the original registration tech until the call ends. |
 | SMS over IMS | Basic send/receive path tested. IMS MESSAGE success now waits for RP-layer result where needed. SMS fallback status codes, fallback cooldown, RP result timeout, and carrier-specific SMSC quirks are policy-driven. |
-| Audio | SIP/RTP media is handled in userspace, but working microphone/earpiece routing still depends on ROM-side Samsung audio HAL fixes and mixer routing. |
+| Audio | SIP/RTP media is handled in userspace, but working microphone/earpiece routing still depends on ROM-side Samsung audio HAL fixes and mixer routing. Optional bundled WebRTC AEC3 is available for speaker echo cancellation and is disabled by default. AMR-WB runs at 16 kHz; AMR-NB is internally resampled from 8 kHz to 16 kHz and back. |
 | USSD/MMI | IMS UT/USSD is not the current goal. Potential USSD/MMI requests are routed over CS when IMS UT/USSD is unavailable. |
 | Video calling / RCS / UT | Not a goal for now. Voice and basic SMS are the focus. |
 
@@ -76,6 +79,7 @@ The current policy model covers:
 - local short-code `phone-context` generation
 - emergency-like dial-string guardrails for the normal MMTel path
 - outgoing PANI policy
+- carrier-specific public-number normalization before outgoing TEL URI generation
 - SingTel-style compact outgoing INVITE/SMS/security behavior
 - P-CSCF registration recovery and transient SIP reconnect handling
 - SMS fallback status codes, fallback cooldown, and RP result wait timeout
@@ -87,6 +91,27 @@ alternate P-CSCF addresses are available, keeps framework IMS registration stabl
 during short controlled SIP transport reconnects, and debounces transient
 `subId=-1` updates during radio/subscription churn before retiring the active
 `SipHandler`.
+
+## Recent call-waiting and media changes
+
+Call waiting keeps active, held, and pending dialogs targetable by Call-ID.
+Accepting a waiting INVITE first holds the active call with a `sendonly`
+re-INVITE. Android can then accept the waiting call, swap active and held calls,
+or resume the held call. When the waiting leg ends, the previously held call is
+automatically resumed. Conference merge is not implemented and is rejected
+without disturbing the existing calls.
+
+The media path avoids blocking RTP receive when decoder input is temporarily
+unavailable, primes and re-buffers downlink PCM around startup and underruns,
+and reports incoming ringing promptly. These changes reduce startup repeats,
+stutter, and long receive stalls without moving media logic back into
+`SipHandler`.
+
+Optional WebRTC AEC3 owns one processor per media generation. The exact PCM
+written to `AudioTrack`, including concealment and silence, is used as the
+far-end render reference. Microphone PCM is accumulated into complete 10 ms
+frames and processed before uplink gain and AMR encoding. AMR-NB audio is
+resampled from 8 kHz to 16 kHz for AEC3 and back to 8 kHz afterward.
 
 
 ## Important Samsung-specific background
@@ -146,6 +171,7 @@ IMS.
 | `219010` | A1 Croatia | REGISTER extra access-network headers; skip reg-event `SUBSCRIBE` requirement. |
 | `232005` | 3 Austria | Service code `333` is forced to CSFB instead of building a normal IMS INVITE. |
 | `286002` | Vodafone Turkey | Plain `tel:` short-code handling for configured local service codes; outgoing access-tech PANI. |
+| `401077` | Tele2 Kazakhstan | Normalize Kazakhstan mobile/public number forms to `+7` E.164 before outgoing TEL URI generation. |
 | `450006` | LG U+ Korea | UDP control socket and non-session AKA policy. |
 | `525001` | SingTel Singapore | Stock-like compact outgoing INVITE/SMS/security shape and SingTel SMSC handling. |
 | `208010` | Test carrier profile | UDP control socket test profile. |
@@ -160,6 +186,7 @@ the target device:
 | Carrier / environment | PLMN / numeric | Current notes |
 | --- | --- | --- |
 | Telekom / T-Mobile Poland | `26002` | Stock Samsung profile shows IMS registered with `mmtel` and `smsip`; PhhIms logs were used for outgoing INVITE-shape debugging. |
+| Tele2 Kazakhstan | `40107` / normalized `401077` | Active carrier-policy/interoperability target. Public-number normalization is modeled, but outgoing HD calls and SMS should remain bring-up status until the full path is revalidated. |
 | Jio India | carrier-specific PLMN varies | Active interoperability target, especially incoming VoLTE behavior. Keep this as test/bring-up unless current logs prove the full path. |
 | Airtel India | carrier-specific PLMN varies | Test/bring-up target; keep carrier behavior policy-driven. |
 | Jazz Pakistan | carrier-specific PLMN varies | Test/bring-up target; keep carrier behavior policy-driven. |
@@ -179,7 +206,9 @@ Important groups:
 
 - `SipRegister*`, `SipChallenge`, `SipSecurity*`, and `SipIpsec*` handle REGISTER, AKA, Security-Server, and IPsec setup.
 - `SipOutgoingInvite*`, `SipIncomingInvite*`, `SipInDialogInvite`, `SipUpdate*`, and `SipRemoteDialogTermination` handle call signalling.
-- `SipAudio*`, `SipUplink*`, `SipDownlink*`, `SipAmrRtpPayload`, and `SipRtp*` handle userspace media and RTP helpers.
+- `SipAudio*`, `SipUplink*`, `SipDownlink*`, `SipEcho*`, `SipAmrRtpPayload`, and `SipRtp*` handle userspace media, optional AEC3, and RTP helpers.
+- `SipCallWaiting*` helpers keep pending/active/held dialogs separated and build hold/resume SDP for call waiting.
+- `app/jni/webrtc_aec_jni.cpp` wraps the pinned `webrtc-aec3` source tree for mono PCM16 render and capture processing.
 - `ImsNetwork*`, `ImsReconnectController`, `ImsTransportGuard`, and `WfcSubscriptionSettingMonitor` handle IMS bearer and VoWiFi/VoLTE access changes.
 - `SipCarrierSettings`, `SipSmsFallbackPolicy`, and `SipOutgoingInviteRetryPolicy` hold carrier-policy-backed behavior for carrier exceptions, SMS fallback, and outgoing call retry/recovery decisions.
 - `SipSmsHandler`, `Sms`, and `SmscAddress` handle SMS-over-IMS.
@@ -206,11 +235,19 @@ to bisect.
 }
 ```
 
-After syncing, initialize the `rnnoise` submodule. `repo sync` does not do this automatically:
+After syncing, initialize all native submodules recursively. `repo sync` does
+not do this automatically. This pulls `rnnoise`, the pinned `webrtc-aec3`
+source tree, and AEC3's nested Abseil dependency:
 
 ```sh
 cd packages/apps/PhhIms
-git submodule update --init app/jni/rnnoise
+git submodule update --init --recursive
+```
+
+For a standalone checkout, clone the repository with its submodules:
+
+```sh
+git clone --recurse-submodules https://github.com/krazey/ims.git
 ```
 
 ## Building in-tree
@@ -220,6 +257,12 @@ Use the Soong/LineageOS build. This is the intended build path.
 `Android.bp` builds `PhhIms` as a privileged platform-signed app using `platform_apis: true`, so it can access the internal telephony/IMS APIs required by `MmTelFeature`, `ImsConfigImplBase`, `Rlog`, and friends.
 
 No Gradle build or public SDK modification is needed for production ROM builds.
+
+The AEC wrapper is self-contained and does not depend on Android's
+`external/webrtc`. The Soong path compiles the pinned AEC3 sources and links the
+platform `cpufeatures` static library. The Gradle/CMake path compiles the Android
+NDK `cpufeatures` source directly. Both paths require the recursive submodule
+checkout described above.
 
 Add the package from your device or common tree:
 
@@ -391,8 +434,6 @@ Validation checklist used for Exynos9830:
 - Phone-info may keep showing the original IMS registration tech during a deferred active-call switch; the important runtime check is that RTP and DTMF continue.
 - If IMS is unavailable when a call starts, Android may use CS fallback and show GSM/GPRS/2G radio tech for that call.
 
-## Samsung audio notes
-
 ## Qualcomm Snapdragon / dm1q integration notes
 
 Current Snapdragon testing covers the Galaxy S23 Ultra (`dm1q`, SM8550 / Qualcomm Snapdragon 8 Gen 2 class) on LineageOS 23.x.
@@ -419,6 +460,8 @@ Validation checklist used for dm1q:
 - Audio routing, microphone gain, and speaker/earpiece behavior are validated separately from SIP/RTP success.
 
 
+## Samsung audio notes
+
 Audio is not solved only inside this app. Samsung HALs often special-case cellular calls and may route capture/playback through modem/baseband paths instead of normal userspace audio paths.
 
 ### Device-side audio integration
@@ -432,6 +475,41 @@ This is not part of this app directly, but without matching ROM-side audio fixes
 Some Samsung HALs treat `MODE_IN_CALL` as a modem-call path. For a userspace IMS stack, `MODE_IN_COMMUNICATION` may be required so `AudioRecord` stays on the real microphone ADC path instead of a baseband uplink PCM.
 
 If calls connect but the microphone is silent, check the HAL routing first before assuming SIP/RTP is broken.
+
+### Optional WebRTC AEC3
+
+AEC3 is intended to remove loudspeaker/earpiece playback leaking back into the
+microphone. It does not replace correct Samsung audio routing, mixer setup, or
+microphone gain. The feature is disabled while the configured delay is zero,
+so device families can be validated independently before enabling it.
+
+The native wrapper consumes mono PCM16 in 10 ms frames. AMR-WB uses its native
+16 kHz PCM rate. AMR-NB is resampled to 16 kHz before AEC3 processing and back
+to 8 kHz before AMR-NB encoding.
+
+## Runtime media and recovery properties
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `persist.phh.ims.webrtc_aec_delay_ms` | `0` | Enable AEC3 with this fixed render-to-capture delay in milliseconds. Positive values are clamped to `1..500` and read when microphone capture starts; zero disables AEC. |
+| `persist.phh.ims.webrtc_aec_strength_pct` | `175` | Echo suppression strength relative to the bundled AEC3 default. Values are clamped to `100..300` and read when microphone capture starts. Values above `100` also keep residual suppression active when the adaptive filter has not converged. |
+| `persist.sys.phhims.uplink_gain_q8` | unset / `0` | Runtime uplink gain override applied after AEC. Values are clamped to `128..768`; `256` is unity gain. |
+| `ro.phhims.uplink_gain_q8` | `256` | Read-only build default used when the persistent uplink gain is unset. |
+| `persist.ims.pcscf_fallback` | unset | Last-resort P-CSCF host or address after RIL-provided addresses and 3GPP DNS discovery fail. |
+
+Example AEC test setup:
+
+```sh
+adb shell setprop persist.phh.ims.webrtc_aec_delay_ms 100
+adb shell setprop persist.phh.ims.webrtc_aec_strength_pct 175
+```
+
+Start a new call after changing these properties. To return to the default
+media path:
+
+```sh
+adb shell setprop persist.phh.ims.webrtc_aec_delay_ms 0
+```
 
 ## Useful debug commands
 
@@ -458,7 +536,7 @@ For broad logs:
 
 ```sh
 adb logcat -b all -v threadtime | grep -iE \
-  'PHH|PhhIms|SipHandler|MmTel|Ims|Iwlan|Qns|P-CSCF|REGISTER|401|INVITE|PRACK|ACK|BYE|CANCEL|RTP|SMS'
+  'PHH|PhhIms|SipHandler|MmTel|Ims|Iwlan|Qns|P-CSCF|REGISTER|401|INVITE|PRACK|ACK|BYE|CANCEL|RTP|AEC|echo|SMS'
 ```
 
 Useful UI check:
@@ -608,6 +686,8 @@ If SIP says the call is established but audio is broken, check:
 - RTP socket lifecycle
 - AMR/AMR-WB codec negotiation
 - whether cleanup from a previous call left stale media threads or sockets
+- whether optional AEC3 is enabled and the session started for the current media generation
+- whether disabling AEC3 changes the symptom, which separates echo processing from HAL routing
 
 ## P-CSCF fallback
 
@@ -651,7 +731,8 @@ For ROM integration, use the in-tree Soong build instead.
 - The app must be privileged and platform-signed.
 - Carrier provisioning still matters. A carrier that does not provision IMS for the SIM/device combination may never register.
 - Keep registration, VoLTE, VoWiFi, SMS, and audio changes in separate commits while rebasing; it makes regressions much easier to isolate.
-- For Samsung bring-up, always test: registration, outgoing call, incoming accept, incoming local end, incoming remote end, incoming reject, SMS send/receive, DTMF, VoWiFi-only, VoLTE-only, VoLTE→VoWiFi, VoWiFi→VoLTE, active-call route switching, and reconnect after IMS bearer loss.
+- For Samsung bring-up, always test: registration, outgoing call, incoming accept, incoming local end, incoming remote end, incoming reject, call waiting accept/hold/swap/resume, SMS send/receive, DTMF, VoWiFi-only, VoLTE-only, VoLTE→VoWiFi, VoWiFi→VoLTE, active-call route switching, and reconnect after IMS bearer loss.
+- When AEC3 is enabled, test both AMR-WB and AMR-NB calls on earpiece and speakerphone, including double-talk, and verify that disabling AEC3 restores the unchanged baseline path.
 
 ## License
 
