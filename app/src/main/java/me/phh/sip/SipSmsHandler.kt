@@ -168,11 +168,29 @@ internal class SipSmsHandler(
         }
     }
 
-    fun clearState() {
-        smsLock.withLock {
+    fun clearState(reason: String = "IMS state reset") {
+        val pending = smsLock.withLock {
+            val drained = pendingOutgoingSmsByCallId.values
+                .distinctBy { it.callId }
+                .toList()
             smsHeadersMap.clear()
             pendingOutgoingSmsByCallId.clear()
             pendingOutgoingSmsByRef.clear()
+            drained
+        }
+
+        pending.forEach { outgoing ->
+            responseCallbackRemover(outgoing.callId)
+            Rlog.w(
+                tag,
+                "Failing pending outgoing SMS during state reset: " +
+                    "reason=$reason ref=${outgoing.ref} callId=${outgoing.callId}",
+            )
+            try {
+                outgoing.failCb()
+            } catch (t: Throwable) {
+                Rlog.d(tag, "Failed reporting outgoing SMS state reset", t)
+            }
         }
     }
 
@@ -192,7 +210,6 @@ internal class SipSmsHandler(
                     return 500
                 }
 
-                val token = smsLock.withLock { smsToken++ }
                 val dest = request.headers["from"]!![0]
                     .getParams()
                     .component1()
@@ -200,7 +217,11 @@ internal class SipSmsHandler(
                     .trimEnd('>')
                 val callId = request.headers["call-id"]!![0]
                 val cseq = request.headers["cseq"]!![0]
-                smsHeadersMap[token] = smsHeaders(dest, callId, cseq)
+                val token = smsLock.withLock {
+                    val nextToken = smsToken++
+                    smsHeadersMap[nextToken] = smsHeaders(dest, callId, cseq)
+                    nextToken
+                }
 
                 try {
                     receivedCb(token, "3gpp", sms.pdu!!)
@@ -442,7 +463,7 @@ internal class SipSmsHandler(
     fun sendSmsAck(token: Int, ref: Int, error: Boolean) {
         Rlog.d(tag, "sending sms ack")
         val body = SipSmsEncodeAck(ref.toByte())
-        val headers = smsHeadersMap.remove(token) ?: return
+        val headers = smsLock.withLock { smsHeadersMap.remove(token) } ?: return
 
         // Do not send ACK on framework error. Should we send an error report?
         if (error) {

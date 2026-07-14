@@ -975,7 +975,7 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         sessionRefresher.cancelAll("IMS reconnect")
         dispatcher.clearCallbacks()
         dispatcher.clearWriters()
-        smsHandler.clearState()
+        smsHandler.clearState("IMS reconnect")
     }
 
 

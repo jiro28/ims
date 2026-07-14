@@ -69,8 +69,19 @@ class PhhImsSms(val slotId: Int) : ImsSmsImplBase() {
                     )
                 }
             )
-        } catch(t: Throwable) {
+        } catch (t: Throwable) {
             android.util.Log.e(TAG, "Failed sending sms", t)
+            try {
+                onSendSmsResultError(
+                    token,
+                    messageRef,
+                    ImsSmsImplBase.SEND_STATUS_ERROR_FALLBACK,
+                    SmsManager.RESULT_ERROR_GENERIC_FAILURE,
+                    RESULT_NO_NETWORK_ERROR,
+                )
+            } catch (callbackFailure: Throwable) {
+                android.util.Log.e(TAG, "Failed reporting SMS send failure", callbackFailure)
+            }
         }
     }
     override fun acknowledgeSms(token: Int, messageRef: Int, result: Int) {
