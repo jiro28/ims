@@ -4135,53 +4135,71 @@ fun onWfcDisabled(reason: String) {
         )
     }
 
-    fun acceptCall(callId: String? = null) {
+    fun acceptCall(
+        callId: String? = null,
+        onFinalResponseSent: (Boolean) -> Unit = {},
+    ) {
         thread {
-            val waiting = pendingWaitingInvite
-            if (waiting != null && callId == waiting.callId) {
-                acceptPendingWaitingInvite(waiting)
-                return@thread
+            val accepted = try {
+                val waiting = pendingWaitingInvite
+                if (waiting != null && callId == waiting.callId) {
+                    acceptPendingWaitingInvite(waiting)
+                } else {
+                    acceptCurrentIncomingCall(callId)
+                }
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Accepting incoming call failed: callId=$callId", t)
+                false
             }
 
-            val acceptTarget = acceptedIncomingCallAfterAccessGuard(callId) ?: return@thread
-            var call = acceptTarget.call
-            val acceptedCallId = acceptTarget.acceptedCallId
-
-            // S9/O2 test mode: never block accept on pending incoming PRACK state.
-            // The network currently does not PRACK our reliable incoming 183, so
-            // waiting here makes the remote side ring until timeout.
-            prAckWaitTracker.dropStaleBeforeAccept(TAG)
-
-            Rlog.d(TAG, "Accepting call")
-            val finalSdp = prepareAcceptedIncomingInviteFinalSdp(
-                call = call,
-                acceptedCallId = acceptedCallId,
-            )
-            call = finalSdp.call
-            val omitFinalSdp = finalSdp.omitFinalSdp
-
-            val msg3 = okAcceptedIncomingInviteFinalResponse(
-                call = call,
-                omitFinalSdp = omitFinalSdp,
-            )
-            val finalResponseWrite = sendAcceptedIncomingInviteFinalResponse(
-                call = call,
-                response = msg3,
-                acceptedCallId = acceptedCallId,
-            ) ?: return@thread
-            val responseWriter = finalResponseWrite.responseWriter
-            val responseBytes = finalResponseWrite.responseBytes
-            prewarmIncomingMediaAfterAccept(call)
-
-            startIncomingInviteFinalResponseRetransmit(
-                acceptedCallId = acceptedCallId,
-                responseWriter = responseWriter,
-                responseBytes = responseBytes,
-            )
-
-            // Do not mark SIP confirmed here. For incoming calls, the dialog is only confirmed
-            // when the remote side ACKs our 200 OK. handleAck() will set callStarted.
+            try {
+                onFinalResponseSent(accepted)
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Incoming accept completion callback failed: callId=$callId", t)
+            }
         }
+    }
+
+    private fun acceptCurrentIncomingCall(callId: String?): Boolean {
+        val acceptTarget = acceptedIncomingCallAfterAccessGuard(callId) ?: return false
+        var call = acceptTarget.call
+        val acceptedCallId = acceptTarget.acceptedCallId
+
+        // S9/O2 test mode: never block accept on pending incoming PRACK state.
+        // The network currently does not PRACK our reliable incoming 183, so
+        // waiting here makes the remote side ring until timeout.
+        prAckWaitTracker.dropStaleBeforeAccept(TAG)
+
+        Rlog.d(TAG, "Accepting call")
+        val finalSdp = prepareAcceptedIncomingInviteFinalSdp(
+            call = call,
+            acceptedCallId = acceptedCallId,
+        )
+        call = finalSdp.call
+        val omitFinalSdp = finalSdp.omitFinalSdp
+
+        val msg3 = okAcceptedIncomingInviteFinalResponse(
+            call = call,
+            omitFinalSdp = omitFinalSdp,
+        )
+        val finalResponseWrite = sendAcceptedIncomingInviteFinalResponse(
+            call = call,
+            response = msg3,
+            acceptedCallId = acceptedCallId,
+        ) ?: return false
+        val responseWriter = finalResponseWrite.responseWriter
+        val responseBytes = finalResponseWrite.responseBytes
+        prewarmIncomingMediaAfterAccept(call)
+
+        startIncomingInviteFinalResponseRetransmit(
+            acceptedCallId = acceptedCallId,
+            responseWriter = responseWriter,
+            responseBytes = responseBytes,
+        )
+
+        // Do not mark SIP confirmed here. For incoming calls, the dialog is only confirmed
+        // when the remote side ACKs our 200 OK. handleAck() will set callStarted.
+        return true
     }
 
     fun prack(resp: SipResponse, cseq: Int) {
@@ -7386,7 +7404,7 @@ fun onWfcDisabled(reason: String) {
             call = acceptedCall,
             response = response,
             acceptedCallId = waitingCallId,
-        ) ?: return true
+        ) ?: return false
         prewarmIncomingMediaAfterAccept(acceptedCall)
         startIncomingInviteFinalResponseRetransmit(
             acceptedCallId = waitingCallId,

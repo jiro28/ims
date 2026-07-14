@@ -206,6 +206,8 @@ class PhhMmTelFeature(
     private val incomingCallListenersLock = Object()
     private val incomingCallListenersByCallId = mutableMapOf<String, ImsCallSessionListener>()
     private val incomingCallProfilesByCallId = mutableMapOf<String, ImsCallProfile>()
+    private val incomingCallConnectedReportersByCallId =
+        mutableMapOf<String, (Map<String, String>) -> Unit>()
     private var lastIncomingCallListener: ImsCallSessionListener? = null
 
     fun getSipHandlerOrNull(): SipHandler? {
@@ -235,6 +237,7 @@ class PhhMmTelFeature(
         synchronized(incomingCallListenersLock) {
             val removed = incomingCallListenersByCallId.remove(callId)
             incomingCallProfilesByCallId.remove(callId)
+            incomingCallConnectedReportersByCallId.remove(callId)
             if (removed != null && lastIncomingCallListener == removed) {
                 lastIncomingCallListener = incomingCallListenersByCallId.values.lastOrNull()
             }
@@ -250,6 +253,7 @@ class PhhMmTelFeature(
                 // the last incoming listener on a miss, otherwise an outgoing
                 // foreground termination can wrongly terminate a waiting call.
                 incomingCallProfilesByCallId.remove(normalizedCallId)
+                incomingCallConnectedReportersByCallId.remove(normalizedCallId)
                 incomingCallListenersByCallId.remove(normalizedCallId)
             } else {
                 val fallbackListener = lastIncomingCallListener
@@ -258,6 +262,7 @@ class PhhMmTelFeature(
                     ?.key
                 if (fallbackCallId != null) {
                     incomingCallProfilesByCallId.remove(fallbackCallId)
+                    incomingCallConnectedReportersByCallId.remove(fallbackCallId)
                     incomingCallListenersByCallId.remove(fallbackCallId)
                 }
                 fallbackListener
@@ -268,6 +273,26 @@ class PhhMmTelFeature(
             }
             return listener
         }
+    }
+
+    private fun rememberIncomingCallConnectedReporter(
+        callId: String,
+        reporter: (Map<String, String>) -> Unit,
+    ) {
+        synchronized(incomingCallListenersLock) {
+            incomingCallConnectedReportersByCallId[callId] = reporter
+        }
+    }
+
+    private fun reportIncomingCallConnected(callId: String, extras: Map<String, String>) {
+        val reporter = synchronized(incomingCallListenersLock) {
+            incomingCallConnectedReportersByCallId[callId]
+        }
+        if (reporter == null) {
+            Rlog.w(TAG, "No IMS session waiting for incoming ACK: callId=$callId")
+            return
+        }
+        reporter(extras)
     }
 
     private fun peekIncomingCallSession(
@@ -995,6 +1020,34 @@ sipHandler.imsFailureCallback = {
             val incomingSession = object: ImsCallSessionImplBase() {
                 var mState = State.IDLE
                 private var sessionListener: ImsCallSessionListener? = null
+                private var connectionReported = false
+                private var terminalReported = false
+
+                fun reportConnected(extras: Map<String, String>) {
+                    if (connectionReported || terminalReported) return
+                    connectionReported = true
+                    mState = State.ESTABLISHED
+                    Rlog.d(
+                        TAG,
+                        "Incoming call confirmed by ACK: callId=$incomingCallId extras=$extras",
+                    )
+                    sessionListener?.callSessionInitiated(callProfile)
+                }
+
+                fun reportAcceptFailure() {
+                    if (connectionReported || terminalReported) return
+                    terminalReported = true
+                    mState = State.TERMINATED
+                    forgetIncomingCallListener(incomingCallId)
+                    sessionListener?.callSessionInitiatingFailed(
+                        ImsReasonInfo(
+                            ImsReasonInfo.CODE_NETWORK_REJECT,
+                            0,
+                            "Could not send SIP 200 response",
+                        ),
+                    )
+                }
+
                 override fun getCallProfile(): ImsCallProfile {
                     return callProfile
                 }
@@ -1037,9 +1090,11 @@ sipHandler.imsFailureCallback = {
                     } else {
                         Rlog.d(TAG, "Accepting call with profile $profile")
                     }
-                    sipHandler.acceptCall(incomingCallId)
-                    mState = State.ESTABLISHED
-                    sessionListener?.callSessionInitiated(callProfile)
+                    sipHandler.acceptCall(incomingCallId) { accepted ->
+                        if (!accepted) {
+                            readyCheckHandler.post { reportAcceptFailure() }
+                        }
+                    }
                 }
 
                 override fun deflect(deflectNumber: String?) {
@@ -1155,11 +1210,23 @@ sipHandler.imsFailureCallback = {
                 }
 
             }
+            rememberIncomingCallConnectedReporter(incomingCallId) { connectedExtras ->
+                incomingSession.reportConnected(connectedExtras)
+            }
             val frameworkCallListener = notifyIncomingCall(incomingSession, incomingSession.getCallId(), Bundle())
             if (frameworkCallListener != null) {
                 incomingSession.setListener(frameworkCallListener)
             } else {
                 Rlog.w(TAG, "Framework rejected incoming IMS call ${incomingSession.getCallId()}")
+                forgetIncomingCallListener(incomingCallId)
+            }
+        }
+        sipHandler.onIncomingCallConnected = { _: Object, extras: Map<String, String> ->
+            val callId = extras["call-id"]?.takeIf { it.isNotBlank() }
+            if (callId == null) {
+                Rlog.w(TAG, "Incoming call connected without Call-ID: extras=$extras")
+            } else {
+                readyCheckHandler.post { reportIncomingCallConnected(callId, extras) }
             }
         }
         sipHandler.onHeldForegroundCallAutoResumed = autoResume@{ _: Object, extras: Map<String, String> ->
