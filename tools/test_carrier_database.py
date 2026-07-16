@@ -35,10 +35,10 @@ class CarrierDatabaseTest(unittest.TestCase):
         return next(item for item in self.globals if item.get("mnoname") == mno)
 
     def test_snapshot_is_complete(self):
-        self.assertEqual(1416, len(self.mappings))
-        self.assertEqual(1370, len(self.profiles))
-        self.assertEqual(560, len(self.root.find("switches")))
-        self.assertEqual(637, len(self.globals))
+        self.assertEqual(1441, len(self.mappings))
+        self.assertEqual(1429, len(self.profiles))
+        self.assertEqual(585, len(self.root.find("switches")))
+        self.assertEqual(666, len(self.globals))
 
     def test_two_digit_mncs_are_canonicalized_without_collision(self):
         self.assertEqual("40177", self.mapping("401077", "Tele2_KZ").get("plmn"))
@@ -71,7 +71,16 @@ class CarrierDatabaseTest(unittest.TestCase):
             ("CU_CN", "CU Mobile VoLTE"),
             ("CTC_CN", "CTC Mobile"),
         ):
-            self.assertEqual("tel", self.profile(mno, name).get("remote_uri_type"))
+            profile = self.profile(mno, name)
+            self.assertEqual("tel", profile.get("remote_uri_type"))
+            self.assertEqual("alerting", profile.get("keep_alive_mode_mo"))
+            self.assertEqual("incoming", profile.get("keep_alive_mode_mt"))
+
+    def test_verizon_keepalive_starts_while_outgoing(self):
+        profile = self.profile("VZW_US", "VZW VoLTE")
+        self.assertEqual("outgoing", profile.get("keep_alive_mode_mo"))
+        self.assertEqual("incoming", profile.get("keep_alive_mode_mt"))
+        self.assertEqual("2000", profile.get("keep_alive_interval"))
 
 
 if __name__ == "__main__":

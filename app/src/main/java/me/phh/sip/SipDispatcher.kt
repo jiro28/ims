@@ -162,6 +162,7 @@ internal class SipDispatcher(
             statusString = when (status) {
                 100 -> "Trying"
                 200 -> "OK"
+                480 -> "Temporarily Unavailable"
                 481 -> "Call/Transaction Does Not Exist"
                 486 -> "Busy Here"
                 487 -> "Request Terminated"

@@ -75,6 +75,10 @@ internal data class SipCarrierPolicyOverlay(
             reconnectAfterFinalFailureDelayMs = longs[
                 "invite_reconnect_after_final_failure_delay_ms"
             ] ?: base.inviteFailurePolicy.reconnectAfterFinalFailureDelayMs,
+            csfbStatusCodes = intSet(
+                "invite_csfb_status_codes",
+                base.inviteFailurePolicy.csfbStatusCodes,
+            ),
         )
 
         return base.copy(
@@ -97,10 +101,16 @@ internal data class SipCarrierPolicyOverlay(
             outgoingInviteShape = strings["outgoing_invite_shape"]
                 ?.let { enumValueOrNull<SipCarrierPolicy.OutgoingInviteShape>(it) }
                 ?: base.outgoingInviteShape,
+            outgoingTargetUriType = strings["outgoing_target_uri_type"]
+                ?.let { enumValueOrNull<SipCarrierPolicy.OutgoingTargetUriType>(it) }
+                ?: base.outgoingTargetUriType,
             securityClientAlgs = stringArrays["security_client_algs"]
                 ?: base.securityClientAlgs,
             securityClientEalgs = stringArrays["security_client_ealgs"]
                 ?: base.securityClientEalgs,
+            minSeSeconds = longs["min_se_seconds"]?.toInt() ?: base.minSeSeconds,
+            sessionExpiresSeconds = longs["session_expires_seconds"]?.toInt()
+                ?: base.sessionExpiresSeconds,
             fallbackEmergencyDialStrings = stringArrays["fallback_emergency_dial_strings"]
                 ?.toSet() ?: base.fallbackEmergencyDialStrings,
             publicNumberNormalizationPolicy = publicNumberPolicy,

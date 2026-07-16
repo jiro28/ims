@@ -196,6 +196,21 @@ internal object SipOutgoingInviteProgressResponses {
             "cseq" to failedCseq,
         )
 
+    fun outgoingFailureRoutingExtras(
+        initialInviteFailed: Boolean,
+        csRetry: Boolean,
+    ): Map<String, String> {
+        val extras = mutableMapOf<String, String>()
+        if (initialInviteFailed) {
+            extras["callStartFailed"] = "true"
+            extras["outgoingCall"] = "true"
+        }
+        if (csRetry) {
+            extras["csRetry"] = "true"
+        }
+        return extras
+    }
+
     fun progressNotification(
         logTag: String,
         response: SipResponse,

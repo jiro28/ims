@@ -43,7 +43,24 @@ data class SipInviteFailurePolicy(
     val authFailureReconnectDelayMs: Long = 1_000L,
     val reconnectAfterFinalFailureStatusCodes: Set<Int> = emptySet(),
     val reconnectAfterFinalFailureDelayMs: Long = 1_000L,
+    val csfbStatusCodes: Set<Int> = emptySet(),
 )
+
+data class SipCallSignalingKeepAlivePolicy(
+    val outgoingMode: String = "none",
+    val incomingMode: String = "none",
+    val intervalMs: Long = 8_000L,
+    val delayFirstPacket: Boolean = false,
+) {
+    fun startsForOutgoing(statusCode: Int): Boolean = when (outgoingMode) {
+        "outgoing" -> statusCode in 100..199
+        "alerting" -> statusCode in 180..199
+        else -> false
+    }
+
+    val startsForIncoming: Boolean
+        get() = incomingMode == "incoming"
+}
 
 data class SipPublicNumberNormalizationPolicy(
     val kazakhstanMobileWithoutCountryCode: Boolean = false,
@@ -81,13 +98,18 @@ data class SipCarrierPolicy(
     val plainTelAllLocalShortCodes: Boolean = false,
     val outgoingPaniPolicy: OutgoingPaniPolicy = OutgoingPaniPolicy.NONE,
     val outgoingInviteShape: OutgoingInviteShape = OutgoingInviteShape.DEFAULT,
+    val outgoingTargetUriType: OutgoingTargetUriType = OutgoingTargetUriType.TEL,
     val securityClientAlgs: List<String> = DEFAULT_SECURITY_CLIENT_ALGS,
     val securityClientEalgs: List<String> = DEFAULT_SECURITY_CLIENT_EALGS,
+    val minSeSeconds: Int = 90,
+    val sessionExpiresSeconds: Int = 1800,
     val fallbackEmergencyDialStrings: Set<String> = emptySet(),
     val publicNumberNormalizationPolicy: SipPublicNumberNormalizationPolicy =
         SipPublicNumberNormalizationPolicy(),
     val registrationRecoveryPolicy: SipRegistrationRecoveryPolicy = SipRegistrationRecoveryPolicy(),
     val smsPolicy: SipSmsPolicy = SipSmsPolicy(),
+    val callSignalingKeepAlivePolicy: SipCallSignalingKeepAlivePolicy =
+        SipCallSignalingKeepAlivePolicy(),
     val inviteFailurePolicy: SipInviteFailurePolicy = SipInviteFailurePolicy(),
 ) {
     val mccMnc: String = mcc + mnc
@@ -137,6 +159,15 @@ data class SipCarrierPolicy(
 
         return paniValue?.let { mapOf("P-Access-Network-Info" to listOf(it)) } ?: emptyMap()
     }
+
+    fun outgoingTargetUri(telUri: String, realm: String): String =
+        when (outgoingTargetUriType) {
+            OutgoingTargetUriType.TEL -> telUri
+            OutgoingTargetUriType.SIP_USER_PHONE -> {
+                val domain = phoneContextForLocalTelUri(realm)
+                "sip:${telUri.removePrefix("tel:")}@$domain;user=phone"
+            }
+        }
 
     fun useSingTelStockPolicy(realm: String, registerTargetRealm: String = realm): Boolean =
         outgoingInviteShape == OutgoingInviteShape.SINGTEL_COMPACT_STOCK ||
@@ -195,6 +226,11 @@ data class SipCarrierPolicy(
         REGISTRATION_ACCESS_TECH,
     }
 
+    enum class OutgoingTargetUriType {
+        TEL,
+        SIP_USER_PHONE,
+    }
+
     enum class OutgoingInviteShape {
         DEFAULT,
         SINGTEL_COMPACT_STOCK,
@@ -230,6 +266,7 @@ data class SipCarrierSettings(
     val mnc: String,
     val policy: SipCarrierPolicy,
     val carrierId: Int = TelephonyManager.UNKNOWN_CARRIER_ID,
+    val databaseRecord: SipCarrierDatabaseRecord? = null,
 ) {
     val mccMnc: String get() = policy.mccMnc
     val isControlSocketUdp: Boolean get() = policy.isControlSocketUdp
@@ -238,7 +275,13 @@ data class SipCarrierSettings(
     val subscribeRegEvent: Boolean get() = policy.subscribeRegEvent
     val registrationRecoveryPolicy: SipRegistrationRecoveryPolicy get() = policy.registrationRecoveryPolicy
     val smsPolicy: SipSmsPolicy get() = policy.smsPolicy
+    val callSignalingKeepAlivePolicy: SipCallSignalingKeepAlivePolicy
+        get() = policy.callSignalingKeepAlivePolicy
     val inviteFailurePolicy: SipInviteFailurePolicy get() = policy.inviteFailurePolicy
+    val outgoingTargetUriType: SipCarrierPolicy.OutgoingTargetUriType
+        get() = policy.outgoingTargetUriType
+    val minSeSeconds: Int get() = policy.minSeSeconds
+    val sessionExpiresSeconds: Int get() = policy.sessionExpiresSeconds
 
     // Legacy names kept while callers are converted.
     val registerNetworkHeaders: SipHeadersMap get() = policy.registerExtraHeaders
@@ -267,6 +310,9 @@ data class SipCarrierSettings(
 
     fun outgoingPaniHeaders(registrationTech: Int): SipHeadersMap =
         policy.outgoingPaniHeaders(registrationTech)
+
+    fun outgoingTargetUri(telUri: String, realm: String): String =
+        policy.outgoingTargetUri(telUri, realm)
 
     fun useSingTelStockPolicy(realm: String, registerTargetRealm: String = realm): Boolean =
         policy.useSingTelStockPolicy(realm, registerTargetRealm)
@@ -335,9 +381,26 @@ data class SipCarrierSettings(
             } catch (_: Throwable) {
                 TelephonyManager.UNKNOWN_CARRIER_ID
             }
+            val databaseRecord = SipCarrierDatabaseXml.find(
+                context = context,
+                query = SipCarrierDatabaseQuery(
+                    mccMnc = mcc + mnc,
+                    imsi = try {
+                        telephonyManager.subscriberId.orEmpty()
+                    } catch (_: Throwable) {
+                        ""
+                    },
+                    spn = try {
+                        telephonyManager.simOperatorName.orEmpty()
+                    } catch (_: Throwable) {
+                        ""
+                    },
+                ),
+            )
             val policy = SipCarrierPolicyXml.apply(
                 context = context,
-                base = SipCarrierPolicy.defaultFor(mcc, mnc),
+                base = databaseRecord?.applyTo(SipCarrierPolicy.defaultFor(mcc, mnc))
+                    ?: SipCarrierPolicy.defaultFor(mcc, mnc),
                 carrierId = carrierId,
             )
             return SipCarrierSettings(
@@ -345,6 +408,7 @@ data class SipCarrierSettings(
                 mnc = mnc,
                 policy = policy,
                 carrierId = carrierId,
+                databaseRecord = databaseRecord,
             )
         }
     }

@@ -36,6 +36,9 @@ PROFILE_KEYS = (
     "invite_timeout",
     "ringing_timer",
     "ringback_timer",
+    "keep_alive_mode_mo",
+    "keep_alive_mode_mt",
+    "keep_alive_interval",
     "mss_size",
     "pcscf_pref",
     "sos_urn_required",
@@ -235,7 +238,7 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument(
         "--source-label",
-        default="Samsung S23 imsservice",
+        default="Samsung S26 imsservice",
         help="human-readable firmware/source label stored in the generated database",
     )
     args = parser.parse_args()

@@ -6,6 +6,7 @@ import java.net.Inet6Address
 object SipContactHeaders {
     private const val MMTEL_CONTACT_FEATURES =
         "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";+g.3gpp.smsip;audio"
+    private const val SMS_ONLY_CONTACT_FEATURES = "+g.3gpp.smsip"
 
     fun localEndpoint(socket: SipConnection, serverPort: Int): String {
         val address = socket.gLocalAddr()
@@ -29,6 +30,21 @@ object SipContactHeaders {
         sipInstance: String,
     ): String =
         """<sip:$userPart@$localEndpoint;transport=$transport>;expires=7200;+sip.instance="$sipInstance";$MMTEL_CONTACT_FEATURES"""
+
+    fun registrationContact(
+        userPart: String,
+        localEndpoint: String,
+        transport: String,
+        sipInstance: String,
+        voiceEnabled: Boolean,
+    ): String {
+        val serviceFeatures = if (voiceEnabled) {
+            MMTEL_CONTACT_FEATURES
+        } else {
+            SMS_ONLY_CONTACT_FEATURES
+        }
+        return """<sip:$userPart@$localEndpoint;transport=$transport>;expires=7200;+sip.instance="$sipInstance";$serviceFeatures"""
+    }
 
     fun viaHeaders(socket: SipConnection, localEndpoint: String): SipHeadersMap {
         val transport = if (socket is SipConnectionTcp) "TCP" else "UDP"

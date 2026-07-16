@@ -97,6 +97,8 @@ internal object SipOutgoingInviteRequestBuilder {
         val carrierRequestShape = buildCarrierRequestShape(
             normalizedPhoneNumber = baseRequestContext.normalizedPhoneNumber,
             telUri = baseRequestContext.telUri,
+            carrierSettings = carrierSettings,
+            realm = realm,
             baseHeaders = baseRequestContext.baseHeaders,
             sipInstance = baseRequestContext.sipInstance,
             localEndpoint = baseRequestContext.localEndpoint,
@@ -191,6 +193,8 @@ internal object SipOutgoingInviteRequestBuilder {
     private fun buildCarrierRequestShape(
         normalizedPhoneNumber: String,
         telUri: String,
+        carrierSettings: SipCarrierSettings,
+        realm: String,
         baseHeaders: Map<String, List<String>>,
         sipInstance: String,
         localEndpoint: String,
@@ -201,10 +205,11 @@ internal object SipOutgoingInviteRequestBuilder {
         singtelStockOutgoingCarrier: Boolean,
         singtelPublicSipUri: (String) -> String,
     ): OutgoingInviteCarrierRequestShape {
+        val databaseOutgoingTargetUri = carrierSettings.outgoingTargetUri(telUri, realm)
         val singtelStockOutgoingTargetUri = if (singtelStockOutgoingCarrier) {
             singtelPublicSipUri(normalizedPhoneNumber)
         } else {
-            telUri
+            databaseOutgoingTargetUri
         }
 
         val singtelStockOutgoingHeaders = if (singtelStockOutgoingCarrier) {
@@ -259,7 +264,7 @@ internal object SipOutgoingInviteRequestBuilder {
                 CSeq: 1 INVITE
             """.toSipHeadersMap()
         } else {
-            baseHeaders
+            baseHeaders + ("to" to listOf("<$databaseOutgoingTargetUri>"))
         }
 
         return OutgoingInviteCarrierRequestShape(

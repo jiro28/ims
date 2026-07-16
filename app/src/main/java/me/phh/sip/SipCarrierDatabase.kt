@@ -57,6 +57,9 @@ data class SipCarrierDatabaseProfile(
     val sessionExpiresSeconds: Int?,
     val ringingTimerSeconds: Int?,
     val ringbackTimerSeconds: Int?,
+    val keepAliveModeMo: String,
+    val keepAliveModeMt: String,
+    val keepAliveIntervalMs: Long?,
     val mssSize: Int?,
 )
 
@@ -67,13 +70,50 @@ data class SipCarrierDatabaseRecord(
     val csfbStatusCodes: Set<Int>,
     val voiceCsfbStatusCodes: Set<Int>,
     val emergencyDomain: String?,
-    val source: String = "Samsung S23 imsservice",
+    val source: String = "Samsung S26 imsservice",
     val verification: String = "firmware_reference",
 ) {
     val voiceProfile: SipCarrierDatabaseProfile?
         get() = profiles.firstOrNull {
             !it.emergency && it.pdn == "ims" && "mmtel" in it.services
         }
+
+    fun applyTo(base: SipCarrierPolicy): SipCarrierPolicy {
+        val profile = voiceProfile ?: return base
+        val supportedAuthAlgorithms = profile.authAlgorithms.filter {
+            it == "hmac-sha-1-96" || it == "hmac-md5-96"
+        }
+        val supportedEncryptionAlgorithms = profile.encryptionAlgorithms.filter {
+            it == "null" || it == "aes-cbc"
+        }
+        val uriType = when (profile.remoteUriType.lowercase()) {
+            "sip" -> SipCarrierPolicy.OutgoingTargetUriType.SIP_USER_PHONE
+            "tel" -> SipCarrierPolicy.OutgoingTargetUriType.TEL
+            else -> base.outgoingTargetUriType
+        }
+
+        return base.copy(
+            subscribeRegEvent = profile.subscribeForReg,
+            outgoingTargetUriType = uriType,
+            securityClientAlgs = supportedAuthAlgorithms.ifEmpty { base.securityClientAlgs },
+            securityClientEalgs = supportedEncryptionAlgorithms.ifEmpty {
+                base.securityClientEalgs
+            },
+            minSeSeconds = profile.minSeSeconds ?: base.minSeSeconds,
+            sessionExpiresSeconds = profile.sessionExpiresSeconds
+                ?: base.sessionExpiresSeconds,
+            callSignalingKeepAlivePolicy = SipCallSignalingKeepAlivePolicy(
+                outgoingMode = profile.keepAliveModeMo,
+                incomingMode = profile.keepAliveModeMt,
+                intervalMs = profile.keepAliveIntervalMs ?: 8_000L,
+                delayFirstPacket = mapping.canonicalMccMnc.take(3) in
+                    setOf("460", "461"),
+            ),
+            inviteFailurePolicy = base.inviteFailurePolicy.copy(
+                csfbStatusCodes = csfbStatusCodes,
+            ),
+        )
+    }
 
 }
 

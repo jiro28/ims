@@ -12,15 +12,17 @@ object SipCommonHeaderBuilder {
         serverPort: Int,
         imei: String,
         imsi: String,
+        voiceEnabled: Boolean = true,
     ): SipCommonHeaderUpdate {
         val local = SipContactHeaders.localEndpoint(socket, serverPort)
         val sipInstance = SipContactHeaders.sipInstanceFromImei(imei)
         val transport = SipContactHeaders.transport(socket)
-        val contact = SipContactHeaders.mmtelContact(
+        val contact = SipContactHeaders.registrationContact(
             userPart = imsi,
             localEndpoint = local,
             transport = transport,
             sipInstance = sipInstance,
+            voiceEnabled = voiceEnabled,
         )
         return SipCommonHeaderUpdate(
             contact = contact,

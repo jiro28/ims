@@ -144,6 +144,9 @@ internal object SipCarrierDatabaseXml {
             sessionExpiresSeconds = parser.attribute("session_expires")?.toIntOrNull(),
             ringingTimerSeconds = parser.attribute("ringing_timer")?.toIntOrNull(),
             ringbackTimerSeconds = parser.attribute("ringback_timer")?.toIntOrNull(),
+            keepAliveModeMo = parser.attribute("keep_alive_mode_mo") ?: "none",
+            keepAliveModeMt = parser.attribute("keep_alive_mode_mt") ?: "none",
+            keepAliveIntervalMs = parser.attribute("keep_alive_interval")?.toLongOrNull(),
             mssSize = parser.attribute("mss_size")?.toIntOrNull(),
         )
 

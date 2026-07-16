@@ -57,7 +57,7 @@ private fun ServiceState.phhIwlanRegistrationForIms(): NetworkRegistrationInfo? 
 private fun ServiceState.isIwlanReadyForPhhIms(): Boolean {
     val iwlanRegistration = phhIwlanRegistrationForIms() ?: return false
 
-    val iwlanRegistered = iwlanRegistration.isRegistered
+    val iwlanRegistered = iwlanRegistration.isNetworkRegistered
 
     val iwlanRat =
         iwlanRegistration.accessNetworkTechnology == TelephonyManager.NETWORK_TYPE_IWLAN
@@ -90,7 +90,7 @@ private fun ServiceState.phhImsReadyDebug(
     val iwlanRegistration = phhIwlanRegistrationForIms()
 
     return "state=$state registeredPlmn=$registeredPlmn " +
-        "iwlanRegistered=${iwlanRegistration?.isRegistered} " +
+        "iwlanRegistered=${iwlanRegistration?.isNetworkRegistered} " +
         "iwlanRat=${iwlanRegistration?.accessNetworkTechnology}"
 }
 
@@ -101,6 +101,8 @@ class PhhMmTelFeature(
 
     // MMTEL capabilities are configured independently per registration technology.
     private val enabledMmTelCapabilitiesByRadioTech = mutableMapOf<Int, Int>()
+    private val configuredMmTelRadioTechs = mutableSetOf<Int>()
+    private var sipRegistrationReadyForCapabilities = false
 
     private fun recomputeEnabledMmTelCapabilitiesLocked(): Int {
         var result = 0
@@ -112,6 +114,7 @@ class PhhMmTelFeature(
 
     private fun setMmTelCapabilityForRadioTech(capability: Int, radioTech: Int, enabled: Boolean) {
         synchronized(enabledMmTelCapabilitiesByRadioTech) {
+            configuredMmTelRadioTechs += radioTech
             val oldCaps = enabledMmTelCapabilitiesByRadioTech[radioTech] ?: 0
             val newCaps = if (enabled) {
                 oldCaps or capability
@@ -126,17 +129,51 @@ class PhhMmTelFeature(
         }
     }
 
-    private fun notifyEnabledMmTelCapabilitiesChanged() {
-        val finalCapabilities = synchronized(enabledMmTelCapabilitiesByRadioTech) {
-            recomputeEnabledMmTelCapabilitiesLocked()
+    private fun configuredCapabilitiesForRadioTech(radioTech: Int): Int? =
+        synchronized(enabledMmTelCapabilitiesByRadioTech) {
+            if (radioTech in configuredMmTelRadioTechs) {
+                enabledMmTelCapabilitiesByRadioTech[radioTech] ?: 0
+            } else {
+                null
+            }
         }
+
+    private fun currentRegistrationTech(): Int? =
+        if (this::sipHandler.isInitialized) sipHandler.getRegistrationTech() else null
+
+    private fun notifyEnabledMmTelCapabilitiesChanged(reason: String) {
+        val registrationTech = currentRegistrationTech()
+        val configuredCapabilities = if (registrationTech != null) {
+            configuredCapabilitiesForRadioTech(registrationTech)
+                ?: MmTelCapabilities.CAPABILITY_TYPE_VOICE
+        } else {
+            synchronized(enabledMmTelCapabilitiesByRadioTech) {
+                recomputeEnabledMmTelCapabilitiesLocked()
+            }
+        }
+        val finalCapabilities = configuredCapabilities or
+            if (sipRegistrationReadyForCapabilities) {
+                MmTelCapabilities.CAPABILITY_TYPE_SMS
+            } else {
+                0
+            }
         Rlog.i(
             TAG,
-            "Final MMTEL capabilities=$finalCapabilities perTech=$enabledMmTelCapabilitiesByRadioTech"
+            "Final MMTEL capabilities=$finalCapabilities registrationTech=$registrationTech " +
+                "reason=$reason perTech=$enabledMmTelCapabilitiesByRadioTech"
         )
         notifyCapabilitiesStatusChanged(
             android.telephony.ims.feature.MmTelFeature.MmTelCapabilities(finalCapabilities)
         )
+    }
+
+    private fun syncSipHandlerVoiceCapability(reason: String) {
+        if (!this::sipHandler.isInitialized) return
+        val registrationTech = sipHandler.getRegistrationTech()
+        val enabled = configuredCapabilitiesForRadioTech(registrationTech)
+            ?.let { it and MmTelCapabilities.CAPABILITY_TYPE_VOICE != 0 }
+            ?: return
+        sipHandler.setMmtelVoiceEnabled(enabled, reason)
     }
 
     protected override fun onChangeEnabledCapabilities(
@@ -167,7 +204,8 @@ class PhhMmTelFeature(
                 android.telephony.ims.feature.ImsFeature.CAPABILITY_SUCCESS
             )
         }
-        notifyEnabledMmTelCapabilitiesChanged()
+        syncSipHandlerVoiceCapability("framework capability change")
+        notifyEnabledMmTelCapabilitiesChanged("framework capability change")
     }
 
     override fun queryCapabilityConfiguration(capability: Int, radioTech: Int): Boolean {
@@ -306,13 +344,8 @@ class PhhMmTelFeature(
     }
 
     private fun refreshMmTelCapabilities(reason: String) {
-        val capabilities = MmTelCapabilities()
-        capabilities.addCapabilities(
-            MmTelCapabilities.CAPABILITY_TYPE_VOICE or
-                MmTelCapabilities.CAPABILITY_TYPE_SMS
-        )
-        Rlog.d(TAG, "Refreshing MmTel capabilities after $reason: $capabilities")
-        notifyCapabilitiesStatusChanged(capabilities)
+        syncSipHandlerVoiceCapability(reason)
+        notifyEnabledMmTelCapabilitiesChanged(reason)
     }
 
     private fun resolveSubIdForSlot(): Int {
@@ -1006,6 +1039,7 @@ class PhhMmTelFeature(
         sipHandlerSubId = subId
         sipHandler = SipHandler(imsService, slotId, subId)
 sipHandler.imsFailureCallback = {
+            sipRegistrationReadyForCapabilities = false
             imsService.getRegistrationForSubscription(slotId, subId).onDeregistered(null)
         }
         sipHandler.imsRegisteringCallback = { tech ->
@@ -1015,6 +1049,7 @@ sipHandler.imsFailureCallback = {
         sipHandler.imsReadyCallback = {
             val tech = sipHandler.getRegistrationTech()
             Rlog.d(TAG, "IMS SIP registered, reporting registration tech $tech")
+            sipRegistrationReadyForCapabilities = true
             imsService.getRegistrationForSubscription(slotId, subId).onRegistered(tech)
             refreshMmTelCapabilities("SIP registered")
         }
@@ -1392,6 +1427,7 @@ sipHandler.imsFailureCallback = {
         outgoingCallRemoteHoldReporter = null
         outgoingCallActive = false
         outgoingCallSipCallId = null
+        sipRegistrationReadyForCapabilities = false
         telephonyManager = null
 
         frameworkSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID
