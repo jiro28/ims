@@ -100,6 +100,8 @@ class SipCarrierPolicyOverlayTest {
     fun `Tele2 profile replaces newer firmware call defaults`() {
         val base = SipCarrierPolicy.defaultFor("401", "077").copy(
             registerGruuSupported = true,
+            outgoingTargetUriType =
+                SipCarrierPolicy.OutgoingTargetUriType.SIP_USER_PHONE,
             callSetupTimerPolicy = SipCallSetupTimerPolicy(
                 ringingTimeoutMs = 90_000L,
                 ringbackTimeoutMs = 90_000L,
@@ -116,12 +118,39 @@ class SipCarrierPolicyOverlayTest {
                 "ringing_timeout_ms" to 120_000L,
                 "ringback_timeout_ms" to 120_000L,
             ),
+            strings = mapOf(
+                "outgoing_target_domain_policy" to "PRIMARY_ASSOCIATED_URI",
+            ),
             stringArrays = mapOf(
                 "invite_csfb_status_codes" to listOf("380", "403", "1117"),
             ),
         ).applyTo(base)
 
         require(!resolved.registerGruuSupported)
+        require(
+            resolved.outgoingTargetDomainPolicy ==
+                SipCarrierPolicy.OutgoingTargetDomainPolicy.PRIMARY_ASSOCIATED_URI,
+        )
+        require(
+            resolved.outgoingTargetUri(
+                telUri = "tel:+00000000000",
+                realm = "ims.mnc077.mcc401.3gppnetwork.org",
+                registeredSipUri = "sip:+00000000001@ims.altel4g.kz",
+            ) == "sip:+00000000000@ims.altel4g.kz;user=phone",
+        )
+        require(
+            resolved.outgoingTargetUri(
+                telUri = "tel:+00000000000",
+                realm = "ims.mnc077.mcc401.3gppnetwork.org",
+            ) == "sip:+00000000000@ims.mnc077.mcc401.3gppnetwork.org;user=phone",
+        )
+        require(
+            base.outgoingTargetUri(
+                telUri = "tel:+00000000000",
+                realm = "ims.mnc077.mcc401.3gppnetwork.org",
+                registeredSipUri = "sip:+00000000001@ims.altel4g.kz",
+            ) == "sip:+00000000000@ims.mnc077.mcc401.3gppnetwork.org;user=phone",
+        )
         require(resolved.callSetupTimerPolicy.ringingTimeoutMs == 120_000L)
         require(resolved.callSetupTimerPolicy.ringbackTimeoutMs == 120_000L)
         require(

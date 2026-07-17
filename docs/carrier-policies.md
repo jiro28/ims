@@ -10,6 +10,12 @@ The XML accepts CarrierConfig-style `boolean`, `long`, `string`, and
 to typed policy fields is centralized in `SipCarrierPolicyOverlay`; unknown
 keys are ignored so a newer policy file can still be read by an older build.
 
+`outgoing_target_domain_policy=PRIMARY_ASSOCIATED_URI` makes SIP call targets
+use the domain of the first SIP identity returned by REGISTER. This is scoped
+to tested carriers because the authentication realm and registered identity
+domain are not interchangeable on every IMS core. Missing or malformed
+associated identities safely fall back to the registration realm.
+
 ## Public reference data
 
 Useful upstream inputs are:
