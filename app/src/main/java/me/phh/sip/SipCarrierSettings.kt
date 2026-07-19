@@ -304,7 +304,9 @@ data class SipCarrierPolicy(
             smsc?.let { "sip:${if (it.startsWith("+")) it else "+$it"}@$SINGTEL_STOCK_REALM" }
                 ?: "sip:$SINGTEL_STOCK_REALM"
         } else {
-            smscSipIdentity ?: "sip:$realm"
+            smscSipIdentity
+                ?: smsc?.let { "sip:${if (it.startsWith("+")) "+$it" else "+$it"}@$realm" }
+                ?: "sip:$realm"
         }
 
     fun smsToUri(realm: String, requestUri: String, smsc: String?, smscSipIdentity: String?): String =
