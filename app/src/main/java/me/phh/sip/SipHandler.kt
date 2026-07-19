@@ -518,7 +518,7 @@ private val smsHandler = SipSmsHandler(
             }
         },
         mySipProvider = { mySip },
-        writerProvider = { socket.gWriter() },
+        writerProvider = { if (requireNonsessAka) plainSocket.gWriter() else socket.gWriter() },
         responseCallbackSetter = { callId, cb -> setResponseCallback(callId, cb) },
         responseCallbackRemover = { callId -> removeResponseCallback(callId) },
         smsSipFailureListener = { smsRealm, statusCode -> smsFallbackPolicy.learnFromSipMessageFailure(smsRealm, statusCode) },
