@@ -510,9 +510,15 @@ private val smsHandler = SipSmsHandler(
         subId = subId,
         carrierSettings = carrierSettings,
         realmProvider = { realm },
-        commonHeadersProvider = { commonHeaders },
+        commonHeadersProvider = {
+            if (requireNonsessAka && akaDigest.isNotEmpty()) {
+                commonHeaders + ("authorization" to akaDigest)
+            } else {
+                commonHeaders
+            }
+        },
         mySipProvider = { mySip },
-        writerProvider = { if (requireNonsessAka) plainSocket.gWriter() else socket.gWriter() },
+        writerProvider = { socket.gWriter() },
         responseCallbackSetter = { callId, cb -> setResponseCallback(callId, cb) },
         responseCallbackRemover = { callId -> removeResponseCallback(callId) },
         smsSipFailureListener = { smsRealm, statusCode -> smsFallbackPolicy.learnFromSipMessageFailure(smsRealm, statusCode) },
