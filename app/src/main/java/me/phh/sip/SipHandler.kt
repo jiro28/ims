@@ -512,7 +512,7 @@ private val smsHandler = SipSmsHandler(
         realmProvider = { realm },
         commonHeadersProvider = {
             if (requireNonsessAka && akaDigest.isNotEmpty()) {
-                commonHeaders + ("authorization" to akaDigest)
+                commonHeaders + ("authorization" to listOf(akaDigest))
             } else {
                 commonHeaders
             }
