@@ -52,17 +52,11 @@ private fun ServiceState.isCellularReadyForPhhIms(
 
     // VoLTE-only networks (Korea, Japan, some US carriers) lack CS
     // voice; the voice registration state stays OUT_OF_SERVICE until
-    // IMS SIP REGISTER completes. Gate on data-attached LTE or NR
-    // with a registered PLMN so the readiness check does not create
-    // a deadlock.
-    if (getDataRegistrationState() != ServiceState.STATE_IN_SERVICE) return false
-
-    val dataRat = rilDataRadioTechnology
-    return dataRat in setOf(
-        TelephonyManager.NETWORK_TYPE_LTE,
-        TelephonyManager.NETWORK_TYPE_LTE_CA,
-        TelephonyManager.NETWORK_TYPE_NR,
-    )
+    // IMS SIP REGISTER completes.  When data is in service on any RAT
+    // and we have a registered PLMN, proceed with IMS setup — the
+    // deadlock is broken.  Avoid matching on exact RAT constants
+    // because Samsung RIL HALs report non-AOSP codes (e.g. 14 = LTE).
+    return getDataRegistrationState() == ServiceState.STATE_IN_SERVICE
 }
 
 private fun ServiceState.phhIwlanRegistrationForIms(): NetworkRegistrationInfo? {
