@@ -1086,7 +1086,7 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         callSignalingKeepAlive.stop("SIP transports closing: $reason")
         val newGeneration = sipReaderGeneration.incrementAndGet()
         Rlog.w(TAG, "Invalidated SIP reader generation=$newGeneration while closing transports: $reason")
-        BoundedCloser.close(TAG, "plainSocket") { if (this::plainSocket.isInitialized) plainSocket.close() }
+        BoundedCloser.close(TAG, "plainSocket") { if (!requireNonsessAka && this::plainSocket.isInitialized) plainSocket.close() }
         BoundedCloser.close(TAG, "socket") { if (this::socket.isInitialized) socket.close() }
         BoundedCloser.close(TAG, "TCP server") { if (this::serverSocket.isInitialized) serverSocket.close() }
         BoundedCloser.close(TAG, "UDP server") { if (this::serverSocketUdp.isInitialized) serverSocketUdp.close() }
@@ -2332,7 +2332,9 @@ fun onWfcDisabled(reason: String) {
         registerChallenge = akaChallengeResult.registerChallenge
         val akaResult = akaChallengeResult.akaResult
 
-        plainSocket.close()
+        if (!requireNonsessAka) {
+            plainSocket.close()
+        }
 
         val registerRealmDecision = applyRegisterRealmDecision(registerChallenge.realm)
         val registerDigestUriRealm = registerRealmDecision.targetRealm
