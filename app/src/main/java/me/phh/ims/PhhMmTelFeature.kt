@@ -44,7 +44,25 @@ private fun ServiceState.phhRegisteredPlmnForIms(): String? {
 private fun ServiceState.isCellularReadyForPhhIms(
     registeredPlmn: String? = phhRegisteredPlmnForIms(),
 ): Boolean {
-    return state == ServiceState.STATE_IN_SERVICE && registeredPlmn != null
+    if (registeredPlmn == null) return false
+
+    // Networks with circuit-switched voice: the combined ServiceState
+    // reports IN_SERVICE once voice CS is usable.
+    if (state == ServiceState.STATE_IN_SERVICE) return true
+
+    // VoLTE-only networks (Korea, Japan, some US carriers) lack CS
+    // voice; the voice registration state stays OUT_OF_SERVICE until
+    // IMS SIP REGISTER completes. Gate on data-attached LTE or NR
+    // with a registered PLMN so the readiness check does not create
+    // a deadlock.
+    if (getDataRegistrationState() != ServiceState.STATE_IN_SERVICE) return false
+
+    val dataRat = rilDataRadioTechnology
+    return dataRat in setOf(
+        TelephonyManager.NETWORK_TYPE_LTE,
+        TelephonyManager.NETWORK_TYPE_LTE_CA,
+        TelephonyManager.NETWORK_TYPE_NR,
+    )
 }
 
 private fun ServiceState.phhIwlanRegistrationForIms(): NetworkRegistrationInfo? {
