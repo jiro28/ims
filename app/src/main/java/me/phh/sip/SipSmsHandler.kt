@@ -403,10 +403,9 @@ internal class SipSmsHandler(
 
         val smsc = if (useSingTelSmsPolicy) carrierSettings.singtelSmsc() else rawSmsc
 
-        // RP-DATA destination address. Passing an empty string makes
-        // PhoneNumberUtils.numberToCalledPartyBCD("") return null and crashes
-        // SipSmsEncodeSms(), so keep it null when we genuinely do not know it.
-        val rpSmsc = smsc?.let { if (it.startsWith("+")) it else "+$it" }
+        // RP-DATA SMSC not needed for IMS SMS delivery.
+        // Passing null lets the IMS core handle SMSC routing.
+        val rpSmsc = null
         val data = SipSmsEncodeSms(ref.toByte(), rpSmsc, pdu)
         Rlog.d(
             tag,
