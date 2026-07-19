@@ -254,6 +254,7 @@ class PhhMmTelFeature(
     private var outgoingCallListener: ImsCallSessionListener? = null
     private var outgoingCallActive = false
     private var outgoingCallSipCallId: String? = null
+    private var outgoingCallProgressed = false
     private var outgoingCallAutoResumeReporter: ((Map<String, String>) -> Unit)? = null
     private var outgoingCallRemoteHoldReporter: ((Map<String, String>, Boolean) -> Unit)? = null
     private val incomingCallListenersLock = Object()
@@ -820,6 +821,7 @@ class PhhMmTelFeature(
             sipHandler.onOutgoingCallProgressing = { _: Object, extras: Map<String, String> ->
                 Rlog.d(TAG, "Outgoing call progressing: $extras")
                 extras["call-id"]?.let { outgoingCallSipCallId = it }
+                outgoingCallProgressed = true
                 val callProfile = makeVoiceCallProfile()
                 callProfile.mMediaProfile.mAudioDirection =
                     android.telephony.ims.ImsStreamMediaProfile.DIRECTION_INACTIVE
@@ -1384,14 +1386,16 @@ sipHandler.imsFailureCallback = {
                 Rlog.d(
                     TAG,
                     "Routing outgoing call cancellation to callId=$cancelledCallId " +
-                        "callStartFailed=$callStartFailed outgoingCall=$outgoingCall",
+                        "callStartFailed=$callStartFailed outgoingCall=$outgoingCall " +
+                        "progressed=$outgoingCallProgressed",
                 )
-                if (callStartFailed) {
+                if (callStartFailed && !outgoingCallProgressed) {
                     outgoingCallListener?.callSessionInitiatingFailed(reasonInfo)
                 } else {
                     outgoingCallListener?.callSessionTerminated(reasonInfo)
                 }
                 outgoingCallActive = false
+                outgoingCallProgressed = false
                 outgoingCallSipCallId = null
                 outgoingCallListener = null
                 outgoingCallAutoResumeReporter = null

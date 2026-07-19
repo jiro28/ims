@@ -405,12 +405,24 @@ internal class SipSmsHandler(
                 "managerSmsc=${managerSmsc != null}",
         )
 
+        // SMSC identity from ISIM is the preferred target for MESSAGE
+        // request-URI and To header.  Many carriers leave the ISIM SMSC
+        // unpopulated and the SmsManager APIs return nothing either.  In
+        // that case send the MESSAGE to the IMPU itself — the IMS core
+        // routes it to the correct SMSC internally.  Sending to bare realm
+        // (sip:ims.mncXXX.mccXXX.3gppnetwork.org) produces 400 Bad Request.
         val smscSipIdentity = smscIdentity?.toString()?.let { normalizeSipTarget(it) }
+            ?: if (rawSmsc != null) null else mySip
         val requestUri = carrierSettings.smsRequestUri(realm, smsc, smscSipIdentity)
         val dest = carrierSettings.smsToUri(realm, requestUri, smsc, smscSipIdentity)
         if (useSingTelSmsPolicy) {
             Rlog.d(tag, "Using carrier-configured IMS SMS request and To URI shape")
         }
+        Rlog.d(
+            tag,
+            "IMS SMS SIP routing: realm=$realm requestUri=$requestUri dest=$dest " +
+                "smsc=${smsc ?: "none"} smscSipIdentity=${smscSipIdentity ?: "none"}",
+        )
 
         val msg = SipRequest(
             SipMethod.MESSAGE,
