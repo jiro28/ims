@@ -318,6 +318,16 @@ internal class SipSmsHandler(
         val realm = realmProvider()
         val mySip = mySipProvider()
         val rawSmsc = frameworkSmsc ?: identitySmsc ?: managerSmsc
+            ?: run {
+                val op = try {
+                    ctxt.getSystemService(android.telephony.TelephonyManager::class.java)
+                        .createForSubscriptionId(subId).simOperator
+                } catch (_: Throwable) { "" }
+                when (op) {
+                    "45006" -> "821080010585"
+                    else -> null
+                }
+            }
 
         /*
          * SingTel IMS SMS must be sent to the operator SMSC URI in the
