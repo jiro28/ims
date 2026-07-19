@@ -106,8 +106,11 @@ private fun ServiceState.phhImsReadyDebug(
     registeredPlmn: String? = phhRegisteredPlmnForIms(),
 ): String {
     val iwlanRegistration = phhIwlanRegistrationForIms()
+    val dataRegState = getDataRegistrationState()
+    val dataRat = rilDataRadioTechnology
 
-    return "state=$state registeredPlmn=$registeredPlmn " +
+    return "voiceState=$state dataState=$dataRegState dataRat=$dataRat " +
+        "registeredPlmn=$registeredPlmn " +
         "iwlanRegistered=${iwlanRegistration?.isNetworkRegistered} " +
         "iwlanRat=${iwlanRegistration?.accessNetworkTechnology}"
 }
